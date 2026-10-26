@@ -47,6 +47,22 @@
 // is hidden only while its current bound still lies inside the box its newest 0-pixel answer was for. The margin
 // shows pixels before the actor itself steps out from behind a wall.
 //
+// Doors, activators, talking activators and terminals ([Activators] bActivatorCulling): they can open, swing or
+// animate, so they take the actors' path: box = the root's world bound (updated by the engine every frame, animation
+// included) plus 5% + fActivatorMargin, rebuilt every frame, hidden only while the current bound is still inside the
+// box of the newest 0-pixel answer. Ones with no shapes (trigger boxes and the like) are never tested.
+//
+// SpeedTree trees and shrubs ([Trees] bTreeCulling): their root is a BSTreeNode, which has its own OnVisible (vtable slot
+// 53 at 0x10669B8 -> BSTreeNode::OnVisible 0x66BF50: only NiNode::OnVisible when trees are on), so they never reach the
+// BSFadeNode hook. Branches, leaves and the billboard are its children, so skipping it skips the whole tree, exactly as
+// when it is outside the view. Leaf cards are stored as their centre points and spread out in the vertex shader
+// (BSTreeModel::CreateLeafGeometry), so a tree's bound does not hold its outer leaves: its box is the bound's cube plus
+// 20% of the radius plus fTreeMargin. FalloutNV.esm places about 18,400 of them (WastelandShrub01, EuonymusBush01,
+// WhiteOak01); Joshua trees and most dead trees are ordinary statics.
+//
+// (0.8.1 drew all of a frame's boxes from one vertex buffer; it saved about 5% of the drawing time, 30 us at 1000
+// tests, for a buffer that had to be released before every device reset, so 0.8.2 went back to one draw per box.)
+//
 // Hidden lamps ([Lamps]): every frame ShadowSceneNode::PreOnVisible runs ShadowSceneLight::TestFrustumCull (call at
 // 0xB5E915, also patched by NVR's KeepLampsInView, which we chain) on each lamp; usFrustumCull (+0x110) = 255 switches
 // the lamp off for that frame, and the game marks the shaders of every shape the lamp lights (kGeometries +0xE0,
@@ -106,6 +122,10 @@ struct Settings {
 	int compareKey = 0xCF;           // switches actors, then oriented boxes, off for comparisons (End)
 	bool actorCulling = true;        // NPCs and creatures are tested and hidden too
 	float actorMargin = 24.0f;       // added around an actor's bound (plus 10% of its radius)
+	bool activatorCulling = true;    // doors, activators, talking activators and terminals are tested and hidden too
+	float activatorMargin = 16.0f;   // added around their bound (plus 5% of its radius)
+	bool treeCulling = true;         // SpeedTree trees and shrubs are tested and hidden too
+	float treeMargin = 32.0f;        // added around a tree's bound (plus 20% of its radius) for its leaf cards
 } gSet;
 
 static void LoadSettings() {
@@ -140,6 +160,14 @@ static void LoadSettings() {
 	gSet.compareKey = readI("Debug", "iCompareKey", 0xCF, 0, 255);
 	gSet.actorCulling = readI("Actors", "bActorCulling", 1, 0, 1) != 0;
 	gSet.actorMargin = readF("Actors", "fActorMargin", 24.0f, 0.0f, 512.0f);
+	gSet.activatorCulling = readI("Activators", "bActivatorCulling", 1, 0, 1) != 0;
+	gSet.activatorMargin = readF("Activators", "fActivatorMargin", 16.0f, 0.0f, 512.0f);
+	Log("Doors, activators, terminals: %s, margin 5%% + %.0f units",
+		gSet.activatorCulling ? "tested and hidden like actors" : "never touched (bActivatorCulling=0)", gSet.activatorMargin);
+	gSet.treeCulling = readI("Trees", "bTreeCulling", 1, 0, 1) != 0;
+	gSet.treeMargin = readF("Trees", "fTreeMargin", 32.0f, 0.0f, 1024.0f);
+	Log("Trees: %s, margin 20%% + %.0f units", gSet.treeCulling ? "tested and hidden like objects" : "never touched (bTreeCulling=0)",
+		gSet.treeMargin);
 	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
 		gSet.actorMargin);
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
@@ -202,6 +230,7 @@ namespace Game {
 	constexpr uintptr_t Call_MainAccumulate = 0x0087415B;   // TESMain::DrawScene -> BSShaderUtil::AccumulateScene 0xB6BEE0
 	constexpr uintptr_t Call_MainOpaque = 0x00874180;       // TESMain::DrawScene -> RenderScenePreResolveDepth 0xB6BA20
 	constexpr uintptr_t Vtbl_FadeOnVisible = 0x010A9064;    // BSFadeNode vtable slot 53 -> BSFadeNode::OnVisible 0xB4E490
+	constexpr uintptr_t Vtbl_TreeOnVisible = 0x010669B8;    // BSTreeNode vtable slot 53 -> BSTreeNode::OnVisible 0x66BF50
 	constexpr uintptr_t Call_LampTest = 0x00B5E915;         // ShadowSceneNode::PreOnVisible -> ShadowSceneLight::TestFrustumCull 0xB9E970
 
 	// ShadowSceneLight / NiLight / shapes (IDA local types)
@@ -273,6 +302,8 @@ struct Record {
 	bool boxPartial = false;                   // built with the frame's vertex budget spent: built again later
 	uint32_t boxGen = 0;                       // box mode it was built in (the compare key changes it)
 	bool actor = false;                        // an NPC or creature: box rebuilt every frame
+	bool door = false;                         // a door, activator or terminal: box rebuilt every frame
+	bool tree = false;                         // a SpeedTree (BSTreeNode): box = bound cube + leaf margin
 	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
 	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
 };
@@ -313,7 +344,10 @@ static bool gCullingOn = true;      // hiding (the hotkey flips it)
 static bool gToggleMessage = false; // show the new state on the HUD after the scene
 static bool gOrientedOn = true;     // bOrientedBoxes, then the compare key
 static bool gActorsOn = true;       // bActorCulling, then the compare key
-static int gCompareMode = 0;        // 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped
+static bool gTreesOn = true;        // bTreeCulling, then the compare key
+static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
+// 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped, 3 trees flipped, 4 doors/activators flipped
+static int gCompareMode = 0;
 static uint32_t gBoxGen = 1;        // changes when the box mode does: boxes are built again
 static bool gCompareMessage = false;
 static int gVertexBudget = 0;       // vertices still to be measured this frame
@@ -342,12 +376,15 @@ struct Stats {
 	double lampsOn = 0, lampsTested = 0, lampsNear = 0, lampsCovered = 0, lampShapes = 0, lampShapesCovered = 0;
 	double lampsOff = 0, lampFlags = 0, lampsWaiting = 0;
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
-	double queryUs = 0, pollUs = 0, planUs = 0, lampIssueUs = 0, objectIssueUs = 0, pollsSkipped = 0, sorted = 0;
+	double queryUs = 0, pollUs = 0, planUs = 0, prepUs = 0, drawUs = 0, pollsSkipped = 0, sorted = 0;
 	double records = 0;
 	double boxesBuilt = 0, boxesOriented = 0, boxesAxisTighter = 0, boxesAnimated = 0, boxesPartial = 0, volumeRatio = 0;
 	double vertexShapes = 0, sphereShapes = 0, oddShapes = 0;
-	double actorSeen = 0, actorCands = 0, actorNear = 0, actorCovered = 0, actorHidden = 0, actorMoved = 0, actorGuard = 0;
-	double actorOld = 0, actorGeoms = 0, actorHiddenGeoms = 0;
+	struct Moving {
+		double seen = 0, cands = 0, nearCam = 0, covered = 0, hidden = 0, moved = 0, guard = 0, old = 0, geoms = 0, hiddenGeoms = 0;
+		double noShapes = 0;
+	} actor, door;
+	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
 } gStats;
 static LARGE_INTEGER gQpcFreq;
 static bool gDepthGrows = true, gLoggedFirst = false;
@@ -477,6 +514,17 @@ static void WalkShapes(void* object, int depth, Shape& s) {
 // axes (each cut to the node's bound too); the smallest box holding the whole object is tested.
 static void RebuildShape(void* node, const float* bound, Record& rec) {
 	Shape s{};
+	if (rec.tree) {   // the bound's cube plus room for the leaf cards (see the header)
+		WalkShapes(node, 0, s);
+		rec.geoms = (uint16_t)min(s.geoms, 65535);
+		const float reach = bound[3] * 1.2f + gSet.treeMargin;
+		for (int i = 0; i < 3; ++i) { rec.mn[i] = bound[i] - reach; rec.mx[i] = bound[i] + reach; }
+		rec.oriented = false;
+		rec.boxPartial = false;
+		rec.boxGen = gBoxGen;
+		OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
+		return;
+	}
 	const float* rot = &Game::At<float>(node, Game::Ni_WorldRotate);
 	const float* org = &Game::At<float>(node, Game::Ni_WorldTranslate);
 	// The local-frame maths needs a true rotation (rot^T * rot = identity); anything else keeps the old box.
@@ -580,53 +628,62 @@ static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos,
 	return OcclusionMath::RotationAngleDegrees(nowRot, gCamRot[slot]) <= gSet.guardDegrees * age;
 }
 
-// NPCs and creatures: box = world bound sphere + margin, every frame; hidden while the current bound is still inside
-// the box of the newest 0-pixel answer (and the camera guard holds, as for objects).
-static bool CollectActor(void* node, void* ref, const float* bound) {
+// Things that move (NPCs and creatures; doors, activators and terminals): box = world bound sphere + margin, every
+// frame; hidden while the current bound is still inside the box of the newest 0-pixel answer (and the camera guard
+// holds, as for objects).
+static bool CollectMoving(void* node, void* ref, const float* bound, bool isActor) {
+	Stats::Moving& st = isActor ? gStats.actor : gStats.door;
 	Record& rec = gRecords[node];
 	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
-	if (rec.lastSeen == 0 || rec.formID != formID || !rec.actor) {
+	if (rec.lastSeen == 0 || rec.formID != formID || rec.actor != isActor || rec.door == isActor) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = formID;
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
-		rec.oriented = false; rec.boxPartial = false;
-		rec.actor = true;
+		rec.oriented = false; rec.boxPartial = false; rec.tree = false;
+		rec.actor = isActor;
+		rec.door = !isActor;
 		Shape s{};
-		WalkShapes(node, 0, s);   // shape count for the log only
+		WalkShapes(node, 0, s);   // shape count (nothing to draw: never tested)
 		rec.geoms = (uint16_t)min(s.geoms, 65535);
 	}
 	rec.lastSeen = gFrame;
 	rec.boxGen = gBoxGen;
-	const float r = bound[3], margin = r * 0.1f + gSet.actorMargin;
+	st.seen += 1;
+	if (!rec.geoms) { st.noShapes += 1; return false; }
+	const float r = bound[3];
+	const float margin = isActor ? r * 0.1f + gSet.actorMargin : r * 0.05f + gSet.activatorMargin;
 	float cmn[3], cmx[3];
 	for (int i = 0; i < 3; ++i) {
 		cmn[i] = bound[i] - r; cmx[i] = bound[i] + r;
 		rec.mn[i] = cmn[i] - margin; rec.mx[i] = cmx[i] + margin;
 	}
 	OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
-	gStats.actorSeen += 1;
-	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { gStats.actorNear += 1; return false; }
+	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { st.nearCam += 1; return false; }
 
-	gStats.actorCands += 1;
-	gStats.actorGeoms += rec.geoms;
+	st.cands += 1;
+	st.geoms += rec.geoms;
 	bool hide = false;
 	if (rec.answered && rec.zeroStreak >= 2) {
-		gStats.actorCovered += 1;
+		st.covered += 1;
 		bool inside = true;
 		for (int i = 0; i < 3; ++i) inside = inside && cmn[i] >= rec.amn[i] && cmx[i] <= rec.amx[i];
 		bool tooOld;
-		if (!inside) gStats.actorMoved += 1;
+		if (!inside) st.moved += 1;
 		else if (AnswerUsable(rec, tooOld)) hide = true;
-		else if (tooOld) gStats.actorOld += 1;
-		else gStats.actorGuard += 1;
+		else if (tooOld) st.old += 1;
+		else st.guard += 1;
 	}
 	gCandidates.push_back({ &rec, hide });
-	if (hide && gCullingOn) { gStats.actorHidden += 1; gStats.actorHiddenGeoms += rec.geoms; }
+	if (hide && gCullingOn) { st.hidden += 1; st.hiddenGeoms += rec.geoms; }
 	return hide;
 }
 
-static __declspec(noinline) bool Collect(void* node) {
+static __declspec(noinline) bool Collect(void* node, bool tree) {
+	if (tree) {
+		gStats.treeSeen += 1;
+		if (!gTreesOn) return false;
+	}
 	gStats.topFade += 1;
 	void* ref = Game::At<void*>(node, Game::Fade_LinkedRef);
 	if (!ref) { gStats.noRef += 1; return false; }
@@ -640,7 +697,12 @@ static __declspec(noinline) bool Collect(void* node) {
 	if (gActorsOn && (refType == Game::kCharacter || refType == Game::kCreature) && mult != Game::kLodBodyPart &&
 		ref != *(void**)Game::PlayerPtr && bound && bound[3] > 0.0f && bound[3] < 10000.0f &&
 		!(Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)) {
-		return CollectActor(node, ref, bound);
+		return CollectMoving(node, ref, bound, true);
+	}
+	if (gActivatorsOn && (baseType == Game::kDOOR || baseType == Game::kACTI || baseType == Game::kTACT ||
+		baseType == Game::kTERM) && refType != Game::kCharacter && refType != Game::kCreature && bound &&
+		bound[3] >= gSet.minRadius && bound[3] < 100000.0f && !(Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)) {
+		return CollectMoving(node, ref, bound, false);
 	}
 	if (refType == Game::kCharacter || refType == Game::kCreature || mult == Game::kLodActors || mult == Game::kLodBodyPart)
 		gStats.actors += 1;
@@ -663,8 +725,8 @@ static __declspec(noinline) bool Collect(void* node) {
 	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
 	const float* pos = &Game::At<float>(node, Game::Ni_WorldTranslate);
 	const float scale = Game::At<float>(node, Game::Ni_WorldScale);
-	const bool same = rec.lastSeen != 0 && !rec.actor && rec.formID == formID && rec.scale == scale && rec.pos[0] == pos[0] &&
-		rec.pos[1] == pos[1] && rec.pos[2] == pos[2];
+	const bool same = rec.lastSeen != 0 && !rec.actor && !rec.door && rec.tree == tree && rec.formID == formID && rec.scale == scale &&
+		rec.pos[0] == pos[0] && rec.pos[1] == pos[1] && rec.pos[2] == pos[2];
 	if (!same) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }   // its answer belongs to the old object
@@ -672,6 +734,8 @@ static __declspec(noinline) bool Collect(void* node) {
 		rec.pos[0] = pos[0]; rec.pos[1] = pos[1]; rec.pos[2] = pos[2];
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
 		rec.actor = false;
+		rec.door = false;
+		rec.tree = tree;
 		RebuildShape(node, bound, rec);
 	} else if (rec.boxGen != gBoxGen || rec.boxPartial) {
 		RebuildShape(node, bound, rec);   // another box mode, or measured in full now: both boxes hold the object, answers stay
@@ -695,6 +759,11 @@ static __declspec(noinline) bool Collect(void* node) {
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
+	if (tree) {
+		gStats.treeCands += 1;
+		gStats.treeGeoms += rec.geoms;
+		if (hide && gCullingOn) { gStats.treeHidden += 1; gStats.treeHiddenGeoms += rec.geoms; }
+	}
 	return hide;
 }
 
@@ -704,8 +773,8 @@ static void OnFault(const char* where) {
 }
 
 // True when the object is to be hidden. An exception draws it (and switches the plugin off).
-static bool SafeCollect(void* node) {
-	__try { return Collect(node); }
+static bool SafeCollect(void* node, bool tree) {
+	__try { return Collect(node, tree); }
 	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting"); return false; }
 }
 
@@ -793,11 +862,43 @@ struct MinimalStates {
 };
 static MinimalStates gStates;
 
+// This frame's tests: boxes projected first (8 corners each), drawn after.
+struct BatchItem { Record* rec; int8_t cls; };   // cls -1 = a lamp
+static std::vector<BatchItem> gBatch;
+static std::vector<OcclusionMath::ScreenVertex> gBatchVerts;   // 8 per item
+
 static IDirect3DQuery9* AcquireQuery(IDirect3DDevice9* device) {
 	if (!gFreeQueries.empty()) { IDirect3DQuery9* q = gFreeQueries.back(); gFreeQueries.pop_back(); return q; }
 	IDirect3DQuery9* q = nullptr;
 	if (FAILED(device->CreateQuery(D3DQUERYTYPE_OCCLUSION, &q))) return nullptr;
 	return q;
+}
+
+// Draws this frame's boxes, each inside its own query. Returns the objects (not lamps) drawn.
+static int DrawBatch(IDirect3DDevice9* device) {
+	const UINT n = (UINT)gBatch.size();
+	OcclusionMath::ScreenVertex tri[36];
+	int objects = 0;
+	for (UINT k = 0; k < n; ++k) {
+		const BatchItem& b = gBatch[k];
+		Record& rec = *b.rec;
+		if (!rec.query) rec.query = AcquireQuery(device);
+		if (!rec.query) break;
+		rec.query->Issue(D3DISSUE_BEGIN);
+		OcclusionMath::ExpandBox(&gBatchVerts[k * 8], tri);
+		device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, tri, sizeof(OcclusionMath::ScreenVertex));
+		rec.query->Issue(D3DISSUE_END);
+		rec.pending = true;
+		rec.issued = gFrame;
+		gPending.push_back(&rec);
+		if (b.cls < 0) { gStats.lampsTested += 1; continue; }
+		for (int i = 0; i < 3; ++i) { rec.tmn[i] = rec.mn[i]; rec.tmx[i] = rec.mx[i]; }
+		++objects;
+		if (b.cls == Scheduler::kCovered) gStats.issuedCovered += 1;
+		else if (b.cls == Scheduler::kNew) gStats.issuedNew += 1;
+		else gStats.issuedVisible += 1;
+	}
+	return objects;
 }
 
 static __declspec(noinline) void RunQueries(void* camera) {
@@ -898,7 +999,21 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		OcclusionMath::ScreenVertex screen[36];
 		int issued = 0;
 
-		// Lamps first: few, and each one decides a whole lamp's passes.
+		// This frame's boxes, projected into the batch: lamps first (few, and each one decides a whole lamp's passes),
+		// then objects in the scheduler's order up to the budget. Drawn together below.
+		gBatch.clear();
+		gBatchVerts.clear();
+		auto add = [&](Record& rec, const float (*corners)[3], int8_t cls) {
+			const size_t at = gBatchVerts.size();
+			gBatchVerts.resize(at + 8);
+			if (!OcclusionMath::ProjectCornerPoints(corners, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
+				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at])) {
+				gBatchVerts.resize(at);
+				return false;
+			}
+			gBatch.push_back({ &rec, cls });
+			return true;
+		};
 		for (Lamp* lamp : gLampCandidates) {
 			Record& rec = lamp->rec;
 			if (rec.pending || lamp->nearCamera) continue;
@@ -906,20 +1021,10 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			// a little longer); hidden and new ones every frame, so a hidden lamp comes back on at once.
 			if (Scheduler::Classify(rec.answered, rec.zeroStreak, gFrame - rec.issued, (uint32_t)gSet.visibleRetest) ==
 				Scheduler::kNotDue) { gStats.lampsWaiting += 1; continue; }
-			if (!OcclusionMath::ProjectBox(rec.mn, rec.mx, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
-				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, screen)) continue;
-			if (!rec.query) rec.query = AcquireQuery(device);
-			if (!rec.query) break;
-			rec.query->Issue(D3DISSUE_BEGIN);
-			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
-			rec.query->Issue(D3DISSUE_END);
-			rec.pending = true;
-			rec.issued = gFrame;
-			gPending.push_back(&rec);
-			gStats.lampsTested += 1;
+			float corners[8][3];
+			OcclusionMath::AxisCorners(rec.mn, rec.mx, corners);
+			add(rec, corners, -1);
 		}
-		QueryPerformanceCounter(&t3);
-		gStats.lampIssueUs += (double)(t3.QuadPart - t2.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
 		for (size_t k = 0; k < order.size(); ++k) {
 			if (issued >= gSet.maxQueries) { gStats.budgetSkips += 1; continue; }
 			// Budget left after the most urgent ones (some reached behind the camera): the next ones in full order, as
@@ -927,26 +1032,14 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			if (k == top) std::sort(order.begin() + k, order.end(), Scheduler::Before);
 			const Scheduler::Item& item = order[k];
 			Record& rec = *gCandidates[item.index].rec;
-			const bool drawable = OcclusionMath::ProjectCorners(rec.corner, posAdjust, &view._11, &proj._11, (float)vp.X,
-				(float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, screen);
-			if (!drawable) { rec.issued = gFrame; gStats.behindCamera += 1; continue; }   // reaches behind the camera: drawn
-			if (!rec.query) rec.query = AcquireQuery(device);
-			if (!rec.query) break;
-			rec.query->Issue(D3DISSUE_BEGIN);
-			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
-			rec.query->Issue(D3DISSUE_END);
-			rec.pending = true;
-			rec.issued = gFrame;
-			gPending.push_back(&rec);
-			for (int i = 0; i < 3; ++i) { rec.tmn[i] = rec.mn[i]; rec.tmx[i] = rec.mx[i]; }
+			if (!add(rec, rec.corner, (int8_t)item.cls)) { rec.issued = gFrame; gStats.behindCamera += 1; continue; }   // drawn
 			++issued;
-			if (item.cls == Scheduler::kCovered) gStats.issuedCovered += 1;
-			else if (item.cls == Scheduler::kNew) gStats.issuedNew += 1;
-			else gStats.issuedVisible += 1;
 		}
-		gStats.issued += issued;
+		QueryPerformanceCounter(&t3);
+		gStats.prepUs += (double)(t3.QuadPart - t2.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		gStats.issued += DrawBatch(device);
 		QueryPerformanceCounter(&t4);
-		gStats.objectIssueUs += (double)(t4.QuadPart - t3.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		gStats.drawUs += (double)(t4.QuadPart - t3.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
 
 		if (gSet.debugBoxes) {
 			gStates.Set(0, 0xF);   // colour into the first target only
@@ -1008,10 +1101,11 @@ static void LogBlock() {
 	char name[64] = "";
 	if (cellName && !IsBadStringPtrA(cellName, 63)) strncpy_s(name, cellName, _TRUNCATE);
 	const double cand = gStats.candidates / f;
-	Log("--- %.0f frames, player at (%.0f, %.0f, %.0f) in cell %08X \"%s\" | actors %s, oriented boxes %s", gStats.frames, px, py,
-		pz, cellID, name, gActorsOn ? "on" : "off", gOrientedOn ? "on" : "off");
+	Log("--- %.0f frames, player at (%.0f, %.0f, %.0f) in cell %08X \"%s\" | actors %s, oriented boxes %s, trees %s, doors/"
+		"activators %s", gStats.frames, px, py, pz, cellID, name, gActorsOn ? "on" : "off", gOrientedOn ? "on" : "off",
+		gTreesOn ? "on" : "off", gActivatorsOn ? "on" : "off");
 	Log("  objects drawn by the main view (per frame): %.0f; not candidates: %.1f no reference, %.1f actors, %.1f doors/lights/"
-		"activators/effects, %.1f distant LOD, %.1f small, %.1f hidden by the game, %.1f near the camera", gStats.topFade / f,
+		"activators/effects (when not tested themselves), %.1f distant LOD, %.1f small, %.1f hidden by the game, %.1f near the camera", gStats.topFade / f,
 		gStats.noRef / f, gStats.actors / f, gStats.kinds / f, gStats.lod / f, gStats.smallObj / f, gStats.culledFlag / f,
 		gStats.nearSkip / f);
 	if (gStats.topFade == 0)
@@ -1020,11 +1114,17 @@ static void LogBlock() {
 		"with it off (%.0f frames)", gCullingOn ? "ON" : "OFF", gStats.hidden / f, gStats.hiddenGeoms / f,
 		gStats.onFrames > 0 ? gStats.onMs / gStats.onFrames : 0.0, gStats.onFrames,
 		gStats.offFrames > 0 ? gStats.offMs / gStats.offFrames : 0.0, gStats.offFrames);
-	Log("  actors (actor culling %s): %.1f per frame drawn by the main view, %.1f near the camera, %.1f tested (%.0f shapes) | "
-		"covered %.1f: hidden %.1f (%.0f shapes), moved out of the tested box %.2f, camera guard %.1f, answer too old %.2f",
-		gActorsOn ? "on" : "off", gStats.actorSeen / f, gStats.actorNear / f, gStats.actorCands / f, gStats.actorGeoms / f,
-		gStats.actorCovered / f, gStats.actorHidden / f, gStats.actorHiddenGeoms / f, gStats.actorMoved / f, gStats.actorGuard / f,
-		gStats.actorOld / f);
+	auto logMoving = [&](const char* what, bool on, const Stats::Moving& m) {
+		Log("  %s (%s): %.1f per frame drawn by the main view, %.1f with nothing to draw, %.1f near the camera, %.1f tested (%.0f "
+			"shapes) | covered %.1f: hidden %.1f (%.0f shapes), moved out of the tested box %.2f, camera guard %.1f, answer too old "
+			"%.2f", what, on ? "on" : "off", m.seen / f, m.noShapes / f, m.nearCam / f, m.cands / f, m.geoms / f, m.covered / f,
+			m.hidden / f, m.hiddenGeoms / f, m.moved / f, m.guard / f, m.old / f);
+	};
+	logMoving("actors", gActorsOn, gStats.actor);
+	logMoving("doors, activators, terminals", gActivatorsOn, gStats.door);
+	Log("  trees (SpeedTree, tree culling %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
+		"(%.0f shapes); counted with the objects above and below", gTreesOn ? "on" : "off", gStats.treeSeen / f, gStats.treeCands / f,
+		gStats.treeGeoms / f, gStats.treeHidden / f, gStats.treeHiddenGeoms / f);
 	Log("  lamps lit in the main view: %.1f per frame (lighting %.0f shapes); tested %.1f (%.1f visible ones waiting their turn), "
 		"near the camera %.1f; reach fully hidden %.1f = %.0f lit shapes (%.1f%%) | switched off %s: %.2f per frame newly, shapes "
 		"re-marked %.2f", gStats.lampsOn / f, gStats.lampShapes / f, gStats.lampsTested / f, gStats.lampsWaiting / f,
@@ -1049,10 +1149,12 @@ static void LogBlock() {
 		gStats.answered > 0 ? gStats.ageSum / gStats.answered : 0.0, gStats.notReady / f, gStats.failed / f, gStats.budgetSkips / f,
 		gStats.records / f);
 	Log("  cost per frame: %.0f us query pass (CPU) = %.0f reading answers (%.1f left for the next frame unasked) + %.0f "
-		"planning (over budget in %.0f%% of frames) + %.0f lamp tests + %.0f object tests | frames skipped: %.0f camera mismatch, %.0f "
+		"planning (over budget in %.0f%% of frames) + %.0f preparing boxes + %.0f drawing the tests | frames skipped: %.0f camera "
+		"mismatch, %.0f "
 		"no depth buffer, %.0f alpha testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
 		gStats.queryUs / f, gStats.pollUs / f, gStats.pollsSkipped / f, gStats.planUs / f, 100.0 * gStats.sorted / f,
-		gStats.lampIssueUs / f, gStats.objectIssueUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
+		gStats.prepUs / f, gStats.drawUs / f,
+		gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
 		gStats.behindCamera / f, gStats.identityResets);
 	gStats = Stats{};
 }
@@ -1166,6 +1268,7 @@ typedef void(__cdecl* Opaque_t)(void*, void*);
 static Opaque_t OrigOpaque = nullptr;
 typedef void(__thiscall* OnVisible_t)(void*, void*);
 static OnVisible_t OrigFadeOnVisible = nullptr;
+static OnVisible_t OrigTreeOnVisible = nullptr;
 
 static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 	const bool active = gSet.enabled && !gFaulted && camera && GetCurrentThreadId() == gMainThread;
@@ -1188,13 +1291,24 @@ static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 
 static void __fastcall FadeOnVisibleHook(void* node, void*, void* culler) {
 	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread) {
-		if (gFadeDepth == 0 && SafeCollect(node) && gCullingOn && !gFaulted) return;   // proven covered: not drawn
+		if (gFadeDepth == 0 && SafeCollect(node, false) && gCullingOn && !gFaulted) return;   // proven covered: not drawn
 		++gFadeDepth;
 		OrigFadeOnVisible(node, culler);
 		--gFadeDepth;
 		return;
 	}
 	OrigFadeOnVisible(node, culler);
+}
+
+static void __fastcall TreeOnVisibleHook(void* node, void*, void* culler) {
+	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread) {
+		if (gFadeDepth == 0 && SafeCollect(node, true) && gCullingOn && !gFaulted) return;   // proven covered: not drawn
+		++gFadeDepth;
+		OrigTreeOnVisible(node, culler);
+		--gFadeDepth;
+		return;
+	}
+	OrigTreeOnVisible(node, culler);
 }
 
 static unsigned gOpaqueCalls = 0;
@@ -1231,13 +1345,17 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gSet.compareKey && controls && !Game::IsInMenuMode() &&
 		Game::GetKeyboardButton(controls, gSet.compareKey, Game::KeyPressed)) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
-		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> as set.
-		gCompareMode = (gCompareMode + 1) % 3;
+		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> trees
+		// flipped -> as set.
+		gCompareMode = (gCompareMode + 1) % 5;
 		gActorsOn = gSet.actorCulling != (gCompareMode == 1);
 		const bool oriented = gSet.orientedBoxes != (gCompareMode == 2);
+		gTreesOn = gSet.treeCulling != (gCompareMode == 3);
+		gActivatorsOn = gSet.activatorCulling != (gCompareMode == 4);
 		if (oriented != gOrientedOn) { gOrientedOn = oriented; ++gBoxGen; }
 		gCompareMessage = true;
-		Log("[frame %u] compare key: actors %s, oriented boxes %s", gFrame, gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF");
+		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s", gFrame, gActorsOn ? "ON" : "OFF",
+			gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
 	gStats.queryUs += MicrosSince(start);
@@ -1254,9 +1372,10 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[3] = { "as set in the INI", "actors switched", "oriented boxes switched" };
-		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, oriented boxes %s", kWhat[gCompareMode],
-			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF");
+		static const char* const kWhat[5] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
+			"doors/activators switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s", kWhat[gCompareMode],
+			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1283,6 +1402,9 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 		return;
 	}
 	OrigFadeOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_FadeOnVisible, &FadeOnVisibleHook);
+	OrigTreeOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_TreeOnVisible, &TreeOnVisibleHook);
+	Log("Tree hook installed: BSTreeNode::OnVisible -> 0x%08X%s", (unsigned)(uintptr_t)OrigTreeOnVisible,
+		(uintptr_t)OrigTreeOnVisible != 0x0066BF50 ? " (through another plugin's hook)" : "");
 	OrigLampTest = (LampTest_t)ReplaceCall(Game::Call_LampTest, &LampTestHook);
 	Log(OrigLampTest ? "Lamp test hook installed -> 0x%08X%s" : "0x%08X: the lamp test call is not a call; lamps are left alone%s",
 		OrigLampTest ? (unsigned)(uintptr_t)OrigLampTest : (unsigned)Game::Call_LampTest,
@@ -1292,6 +1414,8 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gCullingOn = gSet.culling;
 	gOrientedOn = gSet.orientedBoxes;
 	gActorsOn = gSet.actorCulling;
+	gTreesOn = gSet.treeCulling;
+	gActivatorsOn = gSet.activatorCulling;
 	Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 		gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
 }
@@ -1306,7 +1430,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.7.2 (objects, actors and hidden lamps; oriented boxes; cheaper query pass)");
+	Log("Occlusion Culling 0.9.0 (objects, actors, doors/activators, SpeedTree trees and hidden lamps; oriented boxes)");
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);

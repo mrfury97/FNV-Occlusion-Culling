@@ -103,17 +103,29 @@ namespace OcclusionMath {
 		return (mx[0] - mn[0]) * (mx[1] - mn[1]) * (mx[2] - mn[2]);
 	}
 
+	// The 12 triangles of a box as indices into its 8 corners (kCorner order): an index buffer for 8-vertex boxes.
+	static const uint16_t kBoxIndices[36] = { 0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7, 0, 1, 5, 0, 5, 4,
+	                                          3, 6, 2, 3, 7, 6, 0, 4, 7, 0, 7, 3, 1, 2, 6, 1, 6, 5 };
+
+	// A box's 8 corners (world), projected like ProjectToScreen.
+	inline bool ProjectCornerPoints(const float (*corners)[3], const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out8) {
+		Vertex c[8];
+		for (int k = 0; k < 8; ++k) c[k] = { corners[k][0] - origin[0], corners[k][1] - origin[1], corners[k][2] - origin[2], color };
+		return ProjectToScreen(c, 8, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, out8);
+	}
+
+	// The 36 triangle-list vertices of 8 projected corners.
+	inline void ExpandBox(const ScreenVertex* s8, ScreenVertex* out36) {
+		for (int k = 0; k < 36; ++k) out36[k] = s8[kBoxIndices[k]];
+	}
+
 	// The 36 triangle-list vertices of a box given by its 8 corners (world), projected like ProjectToScreen.
 	inline bool ProjectCorners(const float (*corners)[3], const float* origin, const float* view, const float* proj,
 		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out) {
-		static const int tri[12][3] = { { 0, 2, 1 }, { 0, 3, 2 }, { 4, 5, 6 }, { 4, 6, 7 }, { 0, 1, 5 }, { 0, 5, 4 },
-		                                { 3, 6, 2 }, { 3, 7, 6 }, { 0, 4, 7 }, { 0, 7, 3 }, { 1, 2, 6 }, { 1, 6, 5 } };
-		Vertex c[8];
-		for (int k = 0; k < 8; ++k) c[k] = { corners[k][0] - origin[0], corners[k][1] - origin[1], corners[k][2] - origin[2], color };
 		ScreenVertex s[8];
-		if (!ProjectToScreen(c, 8, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, s)) return false;
-		for (int t = 0; t < 12; ++t)
-			for (int i = 0; i < 3; ++i) out[t * 3 + i] = s[tri[t][i]];
+		if (!ProjectCornerPoints(corners, origin, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, color, s)) return false;
+		ExpandBox(s, out);
 		return true;
 	}
 

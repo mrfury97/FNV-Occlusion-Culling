@@ -100,6 +100,16 @@ int main() {
 			same = same && sb[k].x == sv[k].x && sb[k].y == sv[k].y && sb[k].z == sv[k].z && sb[k].rhw == sv[k].rhw;
 		CHECK(same, "ProjectBox differs from BoxTriangles + ProjectToScreen");
 		CHECK(!OcclusionMath::ProjectBox(bmn2, bmx2, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, sb), "ProjectBox accepted a box behind the camera");
+		// 8 projected corners + kBoxIndices (the batched draw) give exactly the 36 vertices of the per-box draw.
+		float ac[8][3];
+		OcclusionMath::AxisCorners(mn, mx, ac);
+		OcclusionMath::ScreenVertex s8[8], s36[36];
+		CHECK(OcclusionMath::ProjectCornerPoints(ac, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, s8), "corner points refused");
+		OcclusionMath::ExpandBox(s8, s36);
+		bool indexed = true;
+		for (int k = 0; k < 36; ++k)
+			indexed = indexed && s36[k].x == sv[k].x && s36[k].y == sv[k].y && s36[k].z == sv[k].z && s36[k].rhw == sv[k].rhw;
+		CHECK(indexed, "indexed corners differ from the 36-vertex box");
 	}
 
 	// Rotation angle: identity vs itself 0, vs a 10 degree yaw 10.

@@ -57,8 +57,10 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 | `fGuardDegreesPerFrame` / `fGuardUnitsPerFrame` | 2.5 / 32 | Camera turn/move per frame of answer age beyond which answers aren't used |
 | `bDebugBoxes` | 0 | Draws the tested boxes (green visible, red hidden) |
 | `bActorCulling` / `fActorMargin` | 1 / 24 | NPCs and creatures (not the player) are hidden when proven covered, only while still inside the box that was tested (bound + 10% + margin). Animation, AI and shadows carry on as when they are outside the view |
+| `bActivatorCulling` / `fActivatorMargin` | 1 / 16 | Doors, activators, talking activators and terminals are hidden when proven covered; like actors, their box follows them every frame (bound + 5% + margin) and they stay hidden only while inside the box that was tested |
+| `bTreeCulling` / `fTreeMargin` | 1 / 32 | SpeedTree trees and shrubs (their own node type, which the object hook never saw) are hidden when proven covered; their box is the bound plus 20% + margin, since leaf cards are spread out on the graphics card |
 | `bOrientedBoxes` | 1 | Tighter boxes: each shape's own vertices give its extent, and the box follows the object's rotation. Shapes whose vertices the game has freed keep their bound spheres; animated objects keep the old box |
-| `iCompareKey` | 207 (End) | Switches one feature at a time against your settings (as set, actors switched, oriented boxes switched); the log starts a new block at each press |
+| `iCompareKey` | 207 (End) | Switches one feature at a time against your settings (as set, actors switched, oriented boxes switched, trees switched, doors/activators switched); the log starts a new block at each press |
 
 ## Tests
 
