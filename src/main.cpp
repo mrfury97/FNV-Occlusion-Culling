@@ -93,6 +93,18 @@
 #include <unordered_map>
 #include <vector>
 
+// Release builds (compiled with /DOC_RELEASE, tools\build_release.bat) leave out the measuring tools: the log blocks
+// of numbers and their timers, the debug boxes and the compare key. The log then holds the start-up lines, the
+// settings, the on/off key and any error. Developer builds keep everything.
+#ifdef OC_RELEASE
+constexpr bool kDevTools = false;
+#define OC_BUILD "release build"
+#else
+constexpr bool kDevTools = true;
+#define OC_BUILD "developer build"
+#endif
+constexpr const char* kVersion = "1.0.0";
+
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
 #include "OcclusionMath.h"
@@ -163,13 +175,13 @@ static void LoadSettings() {
 	gSet.guardUnits = readF("Queries", "fGuardUnitsPerFrame", 32.0f, 1.0f, 1000.0f);
 	gSet.revealDepth = readF("Queries", "fRevealDepth", 150.0f, 0.0f, 100000.0f);
 	gSet.logInterval = readI("Debug", "iLogInterval", 600, 60, 100000);
-	gSet.debugBoxes = readI("Debug", "bDebugBoxes", 0, 0, 1) != 0;
+	gSet.debugBoxes = kDevTools && readI("Debug", "bDebugBoxes", 0, 0, 1) != 0;
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
 	gSet.toggleKey = readI("General", "iToggleKey", 0xD2, 0, 255);
 	gSet.distantLOD = readI("Candidates", "bDistantLOD", 0, 0, 1) != 0;
 	gSet.lampCulling = readI("Lamps", "bLampCulling", 0, 0, 1) != 0;
 	gSet.orientedBoxes = readI("Boxes", "bOrientedBoxes", 1, 0, 1) != 0;
-	gSet.compareKey = readI("Debug", "iCompareKey", 0xCF, 0, 255);
+	gSet.compareKey = kDevTools ? readI("Debug", "iCompareKey", 0xCF, 0, 255) : 0;
 	gSet.actorCulling = readI("Actors", "bActorCulling", 1, 0, 1) != 0;
 	gSet.actorMargin = readF("Actors", "fActorMargin", 24.0f, 0.0f, 512.0f);
 	gSet.activatorCulling = readI("Activators", "bActivatorCulling", 1, 0, 1) != 0;
@@ -183,12 +195,13 @@ static void LoadSettings() {
 	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
 		gSet.actorMargin);
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
-	Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
+	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
+	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
 	Log("Settings: enabled %d, hiding %s at start, on/off key 0x%02X | candidates: radius >= %.0f, box farther than %.0f, "
 		"distant LOD %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
 		"%.0f units per frame | log every %d frames, debug boxes %d", gSet.enabled, gSet.culling ? "on" : "off", gSet.toggleKey,
 		gSet.minRadius, gSet.nearDistance, gSet.distantLOD, gSet.maxQueries, gSet.maxAnswerAge, gSet.visibleRetest, gSet.guardDegrees,
-		gSet.guardUnits, gSet.logInterval, gSet.debugBoxes);
+		gSet.guardUnits, kDevTools ? gSet.logInterval : 0, gSet.debugBoxes);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -937,8 +950,8 @@ static __declspec(noinline) void RunQueries(void* camera) {
 
 	// 1. Answers of earlier frames, oldest first. The card answers in the order the queries were issued, so after the
 	// first one that is not ready yet the rest wait for the next frame without being asked.
-	LARGE_INTEGER t0, t1;
-	QueryPerformanceCounter(&t0);
+	LARGE_INTEGER t0 = {}, t1 = {};
+	if (kDevTools) QueryPerformanceCounter(&t0);
 	size_t kept = 0;
 	bool waiting = false;
 	for (size_t k = 0; k < gPending.size(); ++k) {
@@ -984,8 +997,10 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		}
 	}
 	gPending.resize(kept);
-	QueryPerformanceCounter(&t1);
-	gStats.pollUs += (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+	if (kDevTools) {
+		QueryPerformanceCounter(&t1);
+		gStats.pollUs += (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+	}
 
 	// 2. This frame's queries, only when the renderer's camera is the main camera and a depth buffer is bound.
 	const float* posAdjust = (const float*)Game::PosAdjust;
@@ -1023,9 +1038,11 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		// Over budget, only which ones are tested matters, not their order: pick the most urgent iMaxQueriesPerFrame.
 		const size_t top = (size_t)gSet.maxQueries;
 		if (order.size() > top) { Scheduler::SelectTop(order, top); gStats.sorted += 1; }
-		LARGE_INTEGER t2, t3, t4;
-		QueryPerformanceCounter(&t2);
-		gStats.planUs += (double)(t2.QuadPart - t1.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		LARGE_INTEGER t2 = {}, t3 = {}, t4 = {};
+		if (kDevTools) {
+			QueryPerformanceCounter(&t2);
+			gStats.planUs += (double)(t2.QuadPart - t1.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		}
 
 		D3DVIEWPORT9 vp = {};
 		device->GetViewport(&vp);
@@ -1088,13 +1105,17 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			if (!add(rec, rec.corner, (int8_t)item.cls)) { rec.issued = gFrame; gStats.behindCamera += 1; continue; }   // drawn
 			++issued;
 		}
-		QueryPerformanceCounter(&t3);
-		gStats.prepUs += (double)(t3.QuadPart - t2.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		if (kDevTools) {
+			QueryPerformanceCounter(&t3);
+			gStats.prepUs += (double)(t3.QuadPart - t2.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		}
 		gStats.issued += DrawBatch(device);
-		QueryPerformanceCounter(&t4);
-		gStats.drawUs += (double)(t4.QuadPart - t3.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		if (kDevTools) {
+			QueryPerformanceCounter(&t4);
+			gStats.drawUs += (double)(t4.QuadPart - t3.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		}
 
-		if (gSet.debugBoxes) {
+		if (kDevTools && gSet.debugBoxes) {
 			gStates.Set(0, 0xF);   // colour into the first target only
 			for (const Candidate& c : gCandidates) {
 				const Record& rec = *c.rec;
@@ -1378,12 +1399,12 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		Log("Warning: 600 main opaque passes and none followed the hooked main accumulate (multithreaded rendering on, or "
 			"the camera differs): nothing is measured");
 	if (!camera || camera != gMainCamera || GetCurrentThreadId() != gMainThread) return;
-	LARGE_INTEGER start;
-	QueryPerformanceCounter(&start);
+	LARGE_INTEGER start = {};
+	if (kDevTools) QueryPerformanceCounter(&start);
 
 	// Frame time between main views, credited to the state the frame was drawn in (pauses and loads left out).
 	static LARGE_INTEGER last = {};
-	if (last.QuadPart) {
+	if (kDevTools && last.QuadPart) {
 		const double ms = (double)(start.QuadPart - last.QuadPart) * 1000.0 / (double)gQpcFreq.QuadPart;
 		if (ms > 0.0 && ms < 250.0) {
 			if (gCullingOn) { gStats.onMs += ms; gStats.onFrames += 1; }
@@ -1400,7 +1421,7 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		gToggleMessage = true;
 		Log("[frame %u] hiding switched %s with the key", gFrame, gCullingOn ? "ON" : "OFF");
 	}
-	if (gSet.compareKey && controls && !Game::IsInMenuMode() &&
+	if (kDevTools && gSet.compareKey && controls && !Game::IsInMenuMode() &&
 		Game::GetKeyboardButton(controls, gSet.compareKey, Game::KeyPressed)) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
 		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> trees
@@ -1418,7 +1439,7 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 			gRevealOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
-	gStats.queryUs += MicrosSince(start);
+	if (kDevTools) gStats.queryUs += MicrosSince(start);
 	gCandidates.clear();
 	gLampCandidates.clear();
 	gMainCamera = nullptr;   // one query pass per main accumulate
@@ -1428,7 +1449,10 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	for (int i = 0; i < 9; ++i) gCamRot[slot][i] = gNowRot[i];
 	++gFrame;
 	gStats.frames += 1;
-	if (gStats.frames >= gSet.logInterval) LogBlock();
+	if (gStats.frames >= gSet.logInterval) {
+		if (kDevTools) LogBlock();
+		else gStats = Stats{};   // release builds keep no numbers
+	}
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
@@ -1478,8 +1502,11 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gTreesOn = gSet.treeCulling;
 	gActivatorsOn = gSet.activatorCulling;
 	gRevealOn = gSet.revealDepth > 0.0f;
-	Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
-		gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
+	if (kDevTools)
+		Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
+			gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
+	else
+		Log("Hiding starts %s; key 0x%02X switches it.", gCullingOn ? "ON" : "OFF", gSet.toggleKey);
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info) {
@@ -1492,7 +1519,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.9.2 (objects, actors, doors/activators, SpeedTree trees and hidden lamps; oriented boxes; boxes grow while moving)");
+	Log("Occlusion Culling %s, %s (objects, actors, doors/activators, SpeedTree trees and hidden lamps)", kVersion, OC_BUILD);
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);

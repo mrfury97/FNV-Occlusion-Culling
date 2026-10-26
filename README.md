@@ -1,10 +1,10 @@
 # FNV Occlusion Culling
 
-An xNVSE plugin for Fallout: New Vegas (1.4.0.525) that stops the game from drawing large objects the graphics card has proven are completely hidden behind other things. It works on its own and alongside New Vegas Reloaded. It doesn't change any game logic: AI, scripts, physics and collision behave exactly as before.
+An xNVSE plugin for Fallout: New Vegas (1.4.0.525) that stops the game from drawing objects, NPCs and creatures, doors and activators, SpeedTree trees and lamps the graphics card has proven are completely hidden behind other things. It works on its own and alongside New Vegas Reloaded. It doesn't change any game logic: AI, scripts, physics and collision behave exactly as before.
 
 ## Results
 
-Measured in game with the hotkey switching hiding on and off in the same spot (NVR P83 playtest, DXVK, MSAA 4x):
+Measured in game with the hotkey switching hiding on and off in the same spot (early versions, NVR P83 playtest, native D3D9, MSAA 4x):
 
 | Area | Hiding off | Hiding on | Change |
 |---|---|---|---|
@@ -19,7 +19,8 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 ## How it works
 
 - **Finding the objects.** While the game gathers the main view (`TESMain::DrawScene` 0x873200, its `BSShaderUtil::AccumulateScene` call at 0x87415B), each placed object's root `BSFadeNode` is checked in `OnVisible` (vtable slot 53). Large objects become candidates.
-- **Never touched:** actors, doors, lights, activators, terminals, projectiles and anything near the camera. Small objects and distant LOD are optional (see the INI).
+- **Also tested:** NPCs and creatures, doors, activators and terminals (their box follows them every frame), SpeedTree trees and shrubs (their own `BSTreeNode` hook) and lamps (each lamp's reach; a hidden lamp is switched off for the main view).
+- **Never touched:** the player, light fixtures as objects, projectiles, placeable water and anything near the camera. Small objects and distant LOD are optional (see the INI).
 - **Asking the GPU.** Right after the opaque pass (the `RenderScenePreResolveDepth` call at 0x874180), the depth buffer holds the finished scene. Each candidate's box (the union of its shapes' bounds) is drawn there inside a D3D9 occlusion query, with colour and depth writes off.
   - **Projection:** the boxes are projected on the CPU with the renderer's own camera-relative view and projection, and drawn as pre-transformed vertices. Boxes reaching behind the camera aren't tested.
   - **Depth direction:** detected automatically (NVR uses reversed depth).
@@ -35,14 +36,20 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 
 ## Install
 
-1. Build `OcclusionCulling.vcxproj` (Visual Studio 2019 build tools, v142, Release | Win32), or take the DLL from a release.
-2. Put `OcclusionCulling.dll` and `OcclusionCulling.ini` in `Data\NVSE\Plugins\`.
-3. The log goes to `logs\OcclusionCulling.log` in the game folder. Every 600 frames it records:
-   - what was tested and hidden;
-   - the plugin's own cost;
-   - the average frame time with hiding on vs off.
+Requires Fallout: New Vegas 1.4.0.525 and xNVSE.
+
+1. Take the zip from [Releases](https://github.com/mrfury97/FNV-Occlusion-Culling/releases) and install it with your mod manager, or put `nvse\plugins\OcclusionCulling.dll` and `OcclusionCulling.ini` in `Data\NVSE\Plugins\`.
+2. Play. Insert switches hiding on and off, with a message in the corner.
+3. `logs\OcclusionCulling.log` in the game folder holds the start-up lines, the settings and any error.
+
+## Release and developer builds
+
+- **Release build** (`tools\build_release.bat`, compiled with `OC_RELEASE`, what the releases ship): no measuring log, timers, debug boxes or compare key. Its INI (`release\OcclusionCulling.ini`, made by `tools\make_release_ini.py`) ships the values measured in play: `fMinRadius` 40, `iMaxQueriesPerFrame` 1000, `bDistantLOD` 1, `bLampCulling` 1, `fRevealDepth` 150.
+- **Developer build** (`OcclusionCulling.vcxproj` Release | Win32 as it is, v142): everything, including the `[Debug]` settings. Every `iLogInterval` frames the log records what was tested and hidden, the plugin's own cost per part of the query pass, and the frame time with hiding on vs off.
 
 ## Settings (`OcclusionCulling.ini`)
+
+Defaults below are the developer INI's; the release INI's differences are listed above.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -56,12 +63,14 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 | `iVisibleRetestFrames` | 4 | How often visible objects are retested |
 | `fGuardDegreesPerFrame` / `fGuardUnitsPerFrame` | 2.5 / 32 | Camera turn/move per frame of answer age beyond which answers aren't used |
 | `fRevealDepth` | 150 | Against pop-in when stepping out from behind a wall: while the camera moves, hidden things' test boxes grow on screen by how far the move slides an edge this many units away, so they show up a frame early (an early reveal is retested the next frame). Lower grows more; 0 = off |
-| `bDebugBoxes` | 0 | Draws the tested boxes (green visible, red hidden) |
 | `bActorCulling` / `fActorMargin` | 1 / 24 | NPCs and creatures (not the player) are hidden when proven covered, only while still inside the box that was tested (bound + 10% + margin). Animation, AI and shadows carry on as when they are outside the view |
 | `bActivatorCulling` / `fActivatorMargin` | 1 / 16 | Doors, activators, talking activators and terminals are hidden when proven covered; like actors, their box follows them every frame (bound + 5% + margin) and they stay hidden only while inside the box that was tested |
 | `bTreeCulling` / `fTreeMargin` | 1 / 32 | SpeedTree trees and shrubs (their own node type, which the object hook never saw) are hidden when proven covered; their box is the bound plus 20% + margin, since leaf cards are spread out on the graphics card |
+| `bLampCulling` | 0 | 1 = a lamp whose whole reach is proven covered is switched off for the main view (saves its lighting passes); never within `fNearDistance` |
 | `bOrientedBoxes` | 1 | Tighter boxes: each shape's own vertices give its extent, and the box follows the object's rotation. Shapes whose vertices the game has freed keep their bound spheres; animated objects keep the old box |
-| `iCompareKey` | 207 (End) | Switches one feature at a time against your settings (as set, actors switched, oriented boxes switched, trees switched, doors/activators switched, box growth switched); the log starts a new block at each press |
+| `iCompareKey` | 207 (End) | Developer builds only: switches one feature at a time against your settings (as set, actors switched, oriented boxes switched, trees switched, doors/activators switched, box growth switched); the log starts a new block at each press |
+| `iLogInterval` | 600 | Developer builds only: frames of world view per block of numbers in the log |
+| `bDebugBoxes` | 0 | Developer builds only: draws the tested boxes (green visible, red hidden) |
 
 ## Tests
 
