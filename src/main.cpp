@@ -63,6 +63,16 @@
 // (0.8.1 drew all of a frame's boxes from one vertex buffer; it saved about 5% of the drawing time, 30 us at 1000
 // tests, for a buffer that had to be released before every device reset, so 0.8.2 went back to one draw per box.)
 //
+// Growing boxes while moving ([Queries] fRevealDepth): an answer is one frame old when it is used, so when the camera
+// moves, an object behind an occluder's edge can come into view a frame before its own test says so (pop-in when
+// stepping out from a wall). Rotation moves occluder and object together; a sideways move slides near edges across the
+// screen faster than what lies behind them. So every frame the boxes of things whose last answer was 0 pixels grow on
+// screen by how far the camera's move this frame slides an edge fRevealDepth units away (OcclusionMath::RevealPixels),
+// and they show pixels a frame early instead. Standing still nothing grows; a lower fRevealDepth grows more.
+// Moves under kRevealMinMove units a frame (idle sway, creeping) grow nothing. When a grown box shows pixels, the object
+// is drawn but tested again the very next frame, and one 0-pixel answer puts back the covered state it had before (a
+// grown box's pixels need not be the object's own), so an early reveal costs about two frames of drawing, not six.
+//
 // Hidden lamps ([Lamps]): every frame ShadowSceneNode::PreOnVisible runs ShadowSceneLight::TestFrustumCull (call at
 // 0xB5E915, also patched by NVR's KeepLampsInView, which we chain) on each lamp; usFrustumCull (+0x110) = 255 switches
 // the lamp off for that frame, and the game marks the shaders of every shape the lamp lights (kGeometries +0xE0,
@@ -112,6 +122,7 @@ struct Settings {
 	int visibleRetest = 4;           // a visible object is tested again after this many frames
 	float guardDegrees = 2.5f;       // camera turn per frame of answer age beyond which an answer is not used
 	float guardUnits = 32.0f;        // camera move per frame of answer age
+	float revealDepth = 150.0f;      // boxes grow by how far a camera move slides an edge this far away (0 = off)
 	int logInterval = 600;           // frames per log block
 	bool debugBoxes = false;         // draw the tested boxes (green: visible, red: hidden; red ones through walls)
 	bool culling = true;             // start with hiding on
@@ -150,6 +161,7 @@ static void LoadSettings() {
 	gSet.visibleRetest = readI("Queries", "iVisibleRetestFrames", 4, 1, 16);
 	gSet.guardDegrees = readF("Queries", "fGuardDegreesPerFrame", 2.5f, 0.1f, 45.0f);
 	gSet.guardUnits = readF("Queries", "fGuardUnitsPerFrame", 32.0f, 1.0f, 1000.0f);
+	gSet.revealDepth = readF("Queries", "fRevealDepth", 150.0f, 0.0f, 100000.0f);
 	gSet.logInterval = readI("Debug", "iLogInterval", 600, 60, 100000);
 	gSet.debugBoxes = readI("Debug", "bDebugBoxes", 0, 0, 1) != 0;
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
@@ -303,6 +315,9 @@ struct Record {
 	uint32_t boxGen = 0;                       // box mode it was built in (the compare key changes it)
 	bool actor = false;                        // an NPC or creature: box rebuilt every frame
 	bool door = false;                         // a door, activator or terminal: box rebuilt every frame
+	bool issuedGrown = false;                  // its pending query's box was grown for camera movement
+	bool afterGrown = false;                   // a grown box showed pixels: tested next frame, one 0 restores the streak
+	uint8_t streakBeforeGrown = 0;             // the 0-pixel streak it had before that
 	bool tree = false;                         // a SpeedTree (BSTreeNode): box = bound cube + leaf margin
 	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
 	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
@@ -346,6 +361,8 @@ static bool gOrientedOn = true;     // bOrientedBoxes, then the compare key
 static bool gActorsOn = true;       // bActorCulling, then the compare key
 static bool gTreesOn = true;        // bTreeCulling, then the compare key
 static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
+static bool gRevealOn = true;       // fRevealDepth > 0, then the compare key
+constexpr float kRevealMinMove = 0.5f;   // camera moves below this (units per frame) grow nothing
 // 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped, 3 trees flipped, 4 doors/activators flipped
 static int gCompareMode = 0;
 static uint32_t gBoxGen = 1;        // changes when the box mode does: boxes are built again
@@ -377,6 +394,7 @@ struct Stats {
 	double lampsOff = 0, lampFlags = 0, lampsWaiting = 0;
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
 	double queryUs = 0, pollUs = 0, planUs = 0, prepUs = 0, drawUs = 0, pollsSkipped = 0, sorted = 0;
+	double revealFrames = 0, revealPx = 0, revealMaxPx = 0, revealGrown = 0, revealShown = 0, revealRestored = 0;
 	double records = 0;
 	double boxesBuilt = 0, boxesOriented = 0, boxesAxisTighter = 0, boxesAnimated = 0, boxesPartial = 0, volumeRatio = 0;
 	double vertexShapes = 0, sphereShapes = 0, oddShapes = 0;
@@ -639,7 +657,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = formID;
-		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
+		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
 		rec.oriented = false; rec.boxPartial = false; rec.tree = false;
 		rec.actor = isActor;
 		rec.door = !isActor;
@@ -732,7 +750,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }   // its answer belongs to the old object
 		rec.formID = formID; rec.scale = scale;
 		rec.pos[0] = pos[0]; rec.pos[1] = pos[1]; rec.pos[2] = pos[2];
-		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
+		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
 		rec.actor = false;
 		rec.door = false;
 		rec.tree = tree;
@@ -935,7 +953,21 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			rec.answerFrame = rec.issued;
 			for (int i = 0; i < 3; ++i) { rec.amn[i] = rec.tmn[i]; rec.amx[i] = rec.tmx[i]; }
 			rec.pixels = pixels;
-			rec.zeroStreak = pixels ? 0 : (uint8_t)min(rec.zeroStreak + 1, 255);
+			if (pixels) {
+				// Pixels from a grown box: maybe only the margin. Drawn now, tested next frame (see the header).
+				if (rec.issuedGrown && (rec.zeroStreak > 0 || rec.afterGrown)) {
+					if (!rec.afterGrown) rec.streakBeforeGrown = rec.zeroStreak;   // keep the first one through a run of them
+					rec.afterGrown = true;
+					gStats.revealShown += 1;
+				} else rec.afterGrown = false;
+				rec.zeroStreak = 0;
+			} else if (rec.afterGrown) {
+				rec.zeroStreak = (uint8_t)min(rec.streakBeforeGrown + 1, 255);   // covered after all: as before
+				rec.afterGrown = false;
+				gStats.revealRestored += 1;
+			} else {
+				rec.zeroStreak = (uint8_t)min(rec.zeroStreak + 1, 255);
+			}
 			gStats.answered += 1;
 			gStats.ageSum += gFrame - rec.issued;
 			if (!pixels) gStats.zeroAnswers += 1;
@@ -982,7 +1014,8 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			const Record& rec = *gCandidates[i].rec;
 			if (rec.pending) continue;
 			const uint32_t since = gFrame - rec.issued;
-			const Scheduler::Class cls = Scheduler::Classify(rec.answered, rec.zeroStreak, since, (uint32_t)gSet.visibleRetest);
+			const Scheduler::Class cls = rec.afterGrown ? Scheduler::kCovered :
+				Scheduler::Classify(rec.answered, rec.zeroStreak, since, (uint32_t)gSet.visibleRetest);
 			if (cls == Scheduler::kNotDue) { gStats.notDue += 1; continue; }
 			order.push_back({ (uint8_t)cls, since, i });
 		}
@@ -1003,6 +1036,21 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		// then objects in the scheduler's order up to the budget. Drawn together below.
 		gBatch.clear();
 		gBatchVerts.clear();
+		// How far this frame's camera move can slide an occluder's edge (see the header); the boxes of things last seen
+		// covered grow by that much, so they show pixels the frame before they come out.
+		float grow = 0.0f;
+		if (gRevealOn && gSet.revealDepth > 0.0f && gFrame > 1) {
+			const float* last = gCamPos[(gFrame - 1) % kRing];
+			const float dx = gNowPos[0] - last[0], dy = gNowPos[1] - last[1], dz = gNowPos[2] - last[2];
+			const float move = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if (move >= kRevealMinMove)
+				grow = OcclusionMath::RevealPixels((float)vp.Width * 0.5f, proj._11, move, gSet.revealDepth, (float)vp.Width * 0.25f);
+			if (grow > 0.0f) {
+				gStats.revealFrames += 1;
+				gStats.revealPx += grow;
+				if (grow > gStats.revealMaxPx) gStats.revealMaxPx = grow;
+			}
+		}
 		auto add = [&](Record& rec, const float (*corners)[3], int8_t cls) {
 			const size_t at = gBatchVerts.size();
 			gBatchVerts.resize(at + 8);
@@ -1010,6 +1058,11 @@ static __declspec(noinline) void RunQueries(void* camera) {
 				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at])) {
 				gBatchVerts.resize(at);
 				return false;
+			}
+			rec.issuedGrown = grow > 0.0f && rec.answered && (rec.zeroStreak > 0 || rec.afterGrown);
+			if (rec.issuedGrown) {
+				OcclusionMath::GrowOnScreen(&gBatchVerts[at], grow);
+				gStats.revealGrown += 1;
 			}
 			gBatch.push_back({ &rec, cls });
 			return true;
@@ -1019,8 +1072,8 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			if (rec.pending || lamp->nearCamera) continue;
 			// A lamp whose reach was seen is tested again only every iVisibleRetestFrames frames (it can only stay lit
 			// a little longer); hidden and new ones every frame, so a hidden lamp comes back on at once.
-			if (Scheduler::Classify(rec.answered, rec.zeroStreak, gFrame - rec.issued, (uint32_t)gSet.visibleRetest) ==
-				Scheduler::kNotDue) { gStats.lampsWaiting += 1; continue; }
+			if (!rec.afterGrown && Scheduler::Classify(rec.answered, rec.zeroStreak, gFrame - rec.issued,
+				(uint32_t)gSet.visibleRetest) == Scheduler::kNotDue) { gStats.lampsWaiting += 1; continue; }
 			float corners[8][3];
 			OcclusionMath::AxisCorners(rec.mn, rec.mx, corners);
 			add(rec, corners, -1);
@@ -1148,6 +1201,11 @@ static void LogBlock() {
 		gStats.answered / f, gStats.zeroAnswers / f,
 		gStats.answered > 0 ? gStats.ageSum / gStats.answered : 0.0, gStats.notReady / f, gStats.failed / f, gStats.budgetSkips / f,
 		gStats.records / f);
+	Log("  growing boxes while moving (%s, fRevealDepth %.0f): camera moving in %.0f%% of frames, boxes grown by %.0f px on "
+		"average (most %.0f px), %.1f covered boxes grown per frame | grown boxes that showed pixels %.2f per frame, of those "
+		"covered again the next frame %.2f", gRevealOn ? "on" : "off", gSet.revealDepth, 100.0 * gStats.revealFrames / f,
+		gStats.revealFrames > 0 ? gStats.revealPx / gStats.revealFrames : 0.0, gStats.revealMaxPx, gStats.revealGrown / f,
+		gStats.revealShown / f, gStats.revealRestored / f);
 	Log("  cost per frame: %.0f us query pass (CPU) = %.0f reading answers (%.1f left for the next frame unasked) + %.0f "
 		"planning (over budget in %.0f%% of frames) + %.0f preparing boxes + %.0f drawing the tests | frames skipped: %.0f camera "
 		"mismatch, %.0f "
@@ -1201,7 +1259,7 @@ static __declspec(noinline) void LampNote(void* light, void* culler) {
 		for (int i = 0; i < 3 && !moved; ++i) moved = std::fabs(rec.mn[i] - mn[i]) > 8.0f || std::fabs(rec.mx[i] - mx[i]) > 8.0f;
 		if (moved) {   // another lamp at a reused address, or it moved: old answers are not about this reach
 			if (rec.pending && rec.query) { rec.query->Release(); rec.query = nullptr; }
-			rec.pending = false; rec.answered = false; rec.zeroStreak = 0;
+			rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false;
 			lamp.light = niLight;
 		}
 		for (int i = 0; i < 3; ++i) { rec.mn[i] = mn[i]; rec.mx[i] = mx[i]; }
@@ -1347,15 +1405,17 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
 		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> trees
 		// flipped -> as set.
-		gCompareMode = (gCompareMode + 1) % 5;
+		gCompareMode = (gCompareMode + 1) % 6;
 		gActorsOn = gSet.actorCulling != (gCompareMode == 1);
 		const bool oriented = gSet.orientedBoxes != (gCompareMode == 2);
 		gTreesOn = gSet.treeCulling != (gCompareMode == 3);
 		gActivatorsOn = gSet.activatorCulling != (gCompareMode == 4);
+		gRevealOn = (gSet.revealDepth > 0.0f) != (gCompareMode == 5);
 		if (oriented != gOrientedOn) { gOrientedOn = oriented; ++gBoxGen; }
 		gCompareMessage = true;
-		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s", gFrame, gActorsOn ? "ON" : "OFF",
-			gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF");
+		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s, box growth %s", gFrame,
+			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF",
+			gRevealOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
 	gStats.queryUs += MicrosSince(start);
@@ -1372,10 +1432,11 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[5] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
-			"doors/activators switched" };
-		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s", kWhat[gCompareMode],
-			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF");
+		static const char* const kWhat[6] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
+			"doors/activators switched", "box growth switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s, growth %s",
+			kWhat[gCompareMode], gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF",
+			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1416,6 +1477,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gActorsOn = gSet.actorCulling;
 	gTreesOn = gSet.treeCulling;
 	gActivatorsOn = gSet.activatorCulling;
+	gRevealOn = gSet.revealDepth > 0.0f;
 	Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 		gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
 }
@@ -1430,7 +1492,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.9.0 (objects, actors, doors/activators, SpeedTree trees and hidden lamps; oriented boxes)");
+	Log("Occlusion Culling 0.9.2 (objects, actors, doors/activators, SpeedTree trees and hidden lamps; oriented boxes; boxes grow while moving)");
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);

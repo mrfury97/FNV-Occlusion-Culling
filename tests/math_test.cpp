@@ -110,6 +110,31 @@ int main() {
 		for (int k = 0; k < 36; ++k)
 			indexed = indexed && s36[k].x == sv[k].x && s36[k].y == sv[k].y && s36[k].z == sv[k].z && s36[k].rhw == sv[k].rhw;
 		CHECK(indexed, "indexed corners differ from the 36-vertex box");
+		// Growing on screen: the corners' rectangle grows by exactly px on every side, depths stay.
+		{
+			OcclusionMath::ScreenVertex g8[8];
+			for (int k = 0; k < 8; ++k) g8[k] = s8[k];
+			float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, gx0 = 1e9f, gx1 = -1e9f, gy0 = 1e9f, gy1 = -1e9f;
+			OcclusionMath::GrowOnScreen(g8, 25.0f);
+			bool depths = true;
+			for (int k = 0; k < 8; ++k) {
+				x0 = s8[k].x < x0 ? s8[k].x : x0; x1 = s8[k].x > x1 ? s8[k].x : x1;
+				y0 = s8[k].y < y0 ? s8[k].y : y0; y1 = s8[k].y > y1 ? s8[k].y : y1;
+				gx0 = g8[k].x < gx0 ? g8[k].x : gx0; gx1 = g8[k].x > gx1 ? g8[k].x : gx1;
+				gy0 = g8[k].y < gy0 ? g8[k].y : gy0; gy1 = g8[k].y > gy1 ? g8[k].y : gy1;
+				depths = depths && g8[k].z == s8[k].z && g8[k].rhw == s8[k].rhw;
+			}
+			CHECK(std::fabs((x0 - gx0) - 25.0f) < 0.01f && std::fabs((gx1 - x1) - 25.0f) < 0.01f &&
+				std::fabs((y0 - gy0) - 25.0f) < 0.01f && std::fabs((gy1 - y1) - 25.0f) < 0.01f,
+				"grown rectangle: %.2f %.2f %.2f %.2f", x0 - gx0, gx1 - x1, y0 - gy0, gy1 - y1);
+			CHECK(depths, "growing changed depths");
+		}
+		// Reveal distance: 1920 wide, 75 degree view (proj11 1.303), 6 units of sideways move, edge 100 units away:
+		// 960 * 1.303 * 6 / 100 = 75 px; nothing when still; capped.
+		CHECK(std::fabs(OcclusionMath::RevealPixels(960.0f, 1.303f, 6.0f, 100.0f, 480.0f) - 75.05f) < 0.1f, "reveal px %.2f",
+			OcclusionMath::RevealPixels(960.0f, 1.303f, 6.0f, 100.0f, 480.0f));
+		CHECK(OcclusionMath::RevealPixels(960.0f, 1.303f, 0.0f, 100.0f, 480.0f) == 0.0f, "reveal while still");
+		CHECK(OcclusionMath::RevealPixels(960.0f, 1.303f, 500.0f, 100.0f, 480.0f) == 480.0f, "reveal not capped");
 	}
 
 	// Rotation angle: identity vs itself 0, vs a 10 degree yaw 10.

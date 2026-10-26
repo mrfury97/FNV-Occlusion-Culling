@@ -115,6 +115,27 @@ namespace OcclusionMath {
 		return ProjectToScreen(c, 8, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, out8);
 	}
 
+	// How far (pixels) a moving camera can slide an occluder's edge across the screen in one frame: an edge at view
+	// depth `depth` moves halfWidth * proj11 * move / depth pixels for a sideways camera move of `move` units (things
+	// farther behind it move less, so this bounds what the edge uncovers). Capped at `cap` pixels.
+	inline float RevealPixels(float halfWidth, float proj11, float move, float depth, float cap) {
+		if (!(move > 0.0f) || !(depth > 0.0f)) return 0.0f;
+		const float px = halfWidth * std::fabs(proj11) * move / depth;
+		return px < cap ? px : cap;
+	}
+
+	// Grows a projected box on screen: each corner moves `px` pixels away from the corners' centre along x and y, so
+	// the box covers at least `px` more on every side of its screen rectangle. Depths are kept.
+	inline void GrowOnScreen(ScreenVertex* s8, float px) {
+		float cx = 0.0f, cy = 0.0f;
+		for (int k = 0; k < 8; ++k) { cx += s8[k].x; cy += s8[k].y; }
+		cx *= 0.125f; cy *= 0.125f;
+		for (int k = 0; k < 8; ++k) {
+			s8[k].x += s8[k].x >= cx ? px : -px;
+			s8[k].y += s8[k].y >= cy ? px : -px;
+		}
+	}
+
 	// The 36 triangle-list vertices of 8 projected corners.
 	inline void ExpandBox(const ScreenVertex* s8, ScreenVertex* out36) {
 		for (int k = 0; k < 36; ++k) out36[k] = s8[kBoxIndices[k]];
