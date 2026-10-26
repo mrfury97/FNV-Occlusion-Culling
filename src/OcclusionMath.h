@@ -43,6 +43,26 @@ namespace OcclusionMath {
 			}
 	}
 
+	// Pre-transformed vertex (D3DFVF_XYZRHW | D3DFVF_DIFFUSE): viewport pixels, depth in [MinZ, MaxZ], 1 / w.
+	struct ScreenVertex { float x, y, z, rhw; uint32_t color; };
+
+	// Camera-relative points through view * projection (D3D row vectors, 16 floats each, row-major) into viewport pixels.
+	// False when any point is not in front of the camera (w <= 1 unit): such a box cannot be drawn pre-transformed.
+	inline bool ProjectToScreen(const Vertex* in, int count, const float* view, const float* proj, float vpX, float vpY,
+		float vpW, float vpH, float minZ, float maxZ, ScreenVertex* out) {
+		for (int k = 0; k < count; ++k) {
+			const float p[4] = { in[k].x, in[k].y, in[k].z, 1.0f };
+			float v[4], c[4];
+			for (int j = 0; j < 4; ++j) v[j] = p[0] * view[0 * 4 + j] + p[1] * view[1 * 4 + j] + p[2] * view[2 * 4 + j] + p[3] * view[3 * 4 + j];
+			for (int j = 0; j < 4; ++j) c[j] = v[0] * proj[0 * 4 + j] + v[1] * proj[1 * 4 + j] + v[2] * proj[2 * 4 + j] + v[3] * proj[3 * 4 + j];
+			if (!(c[3] > 1.0f)) return false;
+			const float iw = 1.0f / c[3];
+			out[k] = { vpX + (c[0] * iw * 0.5f + 0.5f) * vpW - 0.5f, vpY + (0.5f - c[1] * iw * 0.5f) * vpH - 0.5f,
+			           minZ + c[2] * iw * (maxZ - minZ), iw, in[k].color };
+		}
+		return true;
+	}
+
 	// Distance from p to the nearest point of the box (0 inside).
 	inline float DistanceToBox(const float* p, const float* mn, const float* mx) {
 		float d2 = 0.0f;

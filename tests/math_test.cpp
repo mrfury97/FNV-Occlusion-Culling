@@ -72,6 +72,27 @@ int main() {
 		CHECK(ca[2] / ca[3] < cb[2] / cb[3], "depth does not grow with distance");
 	}
 
+	// CPU projection matches the matrix maths: the box ahead lands on screen with depth between 0 and 1, the nearer face
+	// nearer (standard depth) or farther (reversed depth); a box reaching behind the camera is refused.
+	{
+		OcclusionMath::ScreenVertex sv[36];
+		CHECK(OcclusionMath::ProjectToScreen(tri, 36, v, p, 0, 0, 1920, 1080, 0, 1, sv), "box ahead refused");
+		bool onScreen = true;
+		for (const auto& x : sv) onScreen = onScreen && x.x >= -0.5f && x.x <= 1919.5f && x.y >= -0.5f && x.y <= 1079.5f && x.z > 0 && x.z < 1;
+		CHECK(onScreen, "projected box ahead is off screen");
+		const OcclusionMath::Vertex nearPt = { 0, 500, 0, 0 }, farPt = { 0, 5000, 0, 0 };
+		OcclusionMath::ScreenVertex sn, sf;
+		CHECK(OcclusionMath::ProjectToScreen(&nearPt, 1, v, p, 0, 0, 1920, 1080, 0, 1, &sn) &&
+			OcclusionMath::ProjectToScreen(&farPt, 1, v, p, 0, 0, 1920, 1080, 0, 1, &sf) && sn.z < sf.z, "standard depth order");
+		CHECK(OcclusionMath::ProjectToScreen(&nearPt, 1, v, rev, 0, 0, 1920, 1080, 0, 1, &sn) &&
+			OcclusionMath::ProjectToScreen(&farPt, 1, v, rev, 0, 0, 1920, 1080, 0, 1, &sf) && sn.z > sf.z, "reversed depth order");
+		CHECK(std::fabs(sn.x - 959.5f) < 0.01f && std::fabs(sn.y - 539.5f) < 0.01f, "point straight ahead not at the centre (%.2f, %.2f)", sn.x, sn.y);
+		const float bmn2[3] = { cam[0] - 300, cam[1] - 100, cam[2] - 200 }, bmx2[3] = { cam[0] + 300, cam[1] + 600, cam[2] + 200 };
+		OcclusionMath::Vertex t2[36];
+		OcclusionMath::BoxTriangles(bmn2, bmx2, cam, 0xFFFFFFFF, t2);
+		CHECK(!OcclusionMath::ProjectToScreen(t2, 36, v, p, 0, 0, 1920, 1080, 0, 1, sv), "box reaching behind the camera accepted");
+	}
+
 	// Rotation angle: identity vs itself 0, vs a 10 degree yaw 10.
 	const float I[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
 	const float c = std::cos(10 * 0.0174533f), s = std::sin(10 * 0.0174533f);

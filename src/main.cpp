@@ -24,7 +24,12 @@
 //     not turned or moved more than the guard allows since (as NVR's HiddenObjectCulling does). A hidden object is still
 //     tested every frame, so it comes back the frame after its box shows a pixel. Shadows, reflections and everything
 //     outside the main view always draw it.
-//   - Every D3D state touched is restored from a state block recorded with exactly those states.
+//   - The boxes are projected on the CPU (pre-transformed XYZRHW vertices), so no transform or vertex-pipeline state is
+//     touched. Only colour writes, depth write/test, culling, scissor/stencil (when on), the shaders, the vertex format and
+//     stream 0 are changed, each read first and set back to exactly that value. No state blocks: re-sending states (a
+//     D3DSBT_ALL snapshot, or toggling alpha testing) disturbed NVIDIA's alpha-to-coverage driver hack that the game uses
+//     with bTransparencyMultisampling and MSAA, and left a dithered speckle on most surfaces until the game restarted.
+//     Alpha testing is never touched: when it is on at that point, no box is tested that frame.
 // Hooks chain to whatever was there (NVR's F10 CPU profiler patches the same two calls when switched on, and chains).
 
 #include <windows.h>
@@ -72,6 +77,8 @@ struct Settings {
 	bool culling = true;             // start with hiding on
 	int toggleKey = 0xD2;            // DirectInput scancode of the on/off key (Insert)
 	bool distantLOD = false;         // also test distant LOD objects
+	int diagnosticKey = 0;           // cycles the test modes below (0 = no key)
+	int diagnosticStart = 0;         // test mode from the first frame (0-3)
 } gSet;
 
 static void LoadSettings() {
@@ -101,6 +108,9 @@ static void LoadSettings() {
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
 	gSet.toggleKey = readI("General", "iToggleKey", 0xD2, 0, 255);
 	gSet.distantLOD = readI("Candidates", "bDistantLOD", 0, 0, 1) != 0;
+	gSet.diagnosticKey = readI("Debug", "iDiagnosticKey", 0, 0, 255);
+	gSet.diagnosticStart = readI("Debug", "iDiagnosticStart", 0, 0, 3);
+	if (gSet.diagnosticStart == 2) gSet.diagnosticStart = 0;
 	Log("Settings: enabled %d, hiding %s at start, on/off key 0x%02X | candidates: radius >= %.0f, box farther than %.0f, "
 		"distant LOD %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
 		"%.0f units per frame | log every %d frames, debug boxes %d", gSet.enabled, gSet.culling ? "on" : "off", gSet.toggleKey,
@@ -214,7 +224,6 @@ struct Candidate {
 static std::unordered_map<void*, Record> gRecords;
 static std::vector<Candidate> gCandidates;
 static std::vector<IDirect3DQuery9*> gFreeQueries;
-static IDirect3DStateBlock9* gState = nullptr;
 static bool gQueriesSupported = true;
 
 // Main-pass tracking
@@ -227,6 +236,14 @@ static uint32_t gFrame = 1;
 static bool gFaulted = false;
 static bool gCullingOn = true;      // hiding (the hotkey flips it)
 static bool gToggleMessage = false; // show the new state on the HUD after the scene
+// Test modes (iDiagnosticKey cycles them), to find which part of the plugin changes NVR's picture:
+//   0 normal
+//   1 no D3D work at all (hooks and collecting only; nothing hidden)
+//   3 queries issued without drawing anything and without touching any state (nothing hidden)
+static int gDiag = 0;
+static const char* const kDiagNames[4] = {
+	"test mode 0: normal", "test mode 1: no graphics work", "test mode 2: (removed)", "test mode 3: queries without drawing" };
+static bool gDiagMessage = false;
 
 // Camera per frame (ring), for the answer guard
 constexpr int kRing = 16;
@@ -241,7 +258,7 @@ struct Stats {
 	double topFade = 0, candidates = 0, noRef = 0, actors = 0, kinds = 0, lod = 0, smallObj = 0, nearSkip = 0, culledFlag = 0;
 	double wouldHide = 0, hideGeoms = 0, candGeoms = 0, guardBlocked = 0, tooOld = 0, noAnswer = 0;
 	double issued = 0, answered = 0, notReady = 0, failed = 0, budgetSkips = 0, ageSum = 0, zeroAnswers = 0;
-	double issuedCovered = 0, issuedNew = 0, issuedVisible = 0, notDue = 0;
+	double issuedCovered = 0, issuedNew = 0, issuedVisible = 0, notDue = 0, behindCamera = 0, alphaTestFrames = 0;
 	double camMismatch = 0, noDepth = 0, identityResets = 0;
 	double hidden = 0, hiddenGeoms = 0;                    // actually not drawn (hiding on)
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
@@ -408,75 +425,74 @@ static void ReleaseAll() {
 	gRecords.clear();
 	for (IDirect3DQuery9* q : gFreeQueries) q->Release();
 	gFreeQueries.clear();
-	if (gState) { gState->Release(); gState = nullptr; }
 	gCandidates.clear();
 }
 
-static constexpr DWORD kFVF = D3DFVF_XYZ | D3DFVF_DIFFUSE;
+static constexpr DWORD kFVF = D3DFVF_XYZRHW | D3DFVF_DIFFUSE;
 
-static void SetQueryStates(IDirect3DDevice9* device, const D3DMATRIX& view, const D3DMATRIX& proj) {
-	D3DMATRIX identity = {};
-	identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
-	device->SetVertexShader(nullptr);
-	device->SetPixelShader(nullptr);
-	device->SetFVF(kFVF);
-	device->SetTexture(0, nullptr);
-	device->SetTransform(D3DTS_WORLD, &identity);
-	device->SetTransform(D3DTS_VIEW, &view);
-	device->SetTransform(D3DTS_PROJECTION, &proj);
-	device->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
-	device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
-	device->SetRenderState(D3DRS_ZFUNC, gDepthGrows ? D3DCMP_LESSEQUAL : D3DCMP_GREATEREQUAL);
-	device->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
-	device->SetRenderState(D3DRS_COLORWRITEENABLE1, 0);
-	device->SetRenderState(D3DRS_COLORWRITEENABLE2, 0);
-	device->SetRenderState(D3DRS_COLORWRITEENABLE3, 0);
-	device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-	device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-	device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-	device->SetRenderState(D3DRS_TWOSIDEDSTENCILMODE, FALSE);
-	device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-	device->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
-	device->SetRenderState(D3DRS_FOGENABLE, FALSE);
-	device->SetRenderState(D3DRS_LIGHTING, FALSE);
-	device->SetRenderState(D3DRS_CLIPPLANEENABLE, 0);
-	device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
-	device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
-	device->SetRenderState(D3DRS_DEPTHBIAS, 0);
-	device->SetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, 0);
-	device->SetRenderState(D3DRS_CLIPPING, TRUE);
-	device->SetRenderState(D3DRS_VERTEXBLEND, D3DVBF_DISABLE);
-	device->SetRenderState(D3DRS_INDEXEDVERTEXBLENDENABLE, FALSE);
-	device->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
-	device->SetRenderState(D3DRS_COLORVERTEX, TRUE);
-	device->SetRenderState(D3DRS_ANTIALIASEDLINEENABLE, FALSE);
-	device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-	device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-	device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-	device->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-}
+// The few device states the box draws need, each read first and put back to exactly that value (see the header).
+struct MinimalStates {
+	static constexpr int kStates = 9;
+	IDirect3DDevice9* device = nullptr;
+	D3DRENDERSTATETYPE type[kStates] = { D3DRS_COLORWRITEENABLE, D3DRS_COLORWRITEENABLE1, D3DRS_COLORWRITEENABLE2,
+		D3DRS_COLORWRITEENABLE3, D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_STENCILENABLE, D3DRS_SCISSORTESTENABLE };
+	DWORD saved[kStates] = {}, now[kStates] = {};
+	DWORD cull = 0, fvf = 0;
+	IDirect3DVertexShader9* vs = nullptr;
+	IDirect3DPixelShader9* ps = nullptr;
+	IDirect3DVertexDeclaration9* decl = nullptr;
+	IDirect3DVertexBuffer9* vb = nullptr;
+	UINT offset = 0, stride = 0;
+	bool active = false;
 
-// A state block holding exactly the states drawn with below; Capture() before, Apply() after. It is recorded inside a
-// full snapshot so the recording itself cannot leave anything changed, whatever the driver does while recording.
-static bool EnsureStateBlock(IDirect3DDevice9* device) {
-	if (gState) return true;
-	IDirect3DStateBlock9* all = nullptr;
-	if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &all)) || !all) return false;
-	bool ok = SUCCEEDED(device->BeginStateBlock());
-	if (ok) {
-		D3DMATRIX identity = {};
-		identity._11 = identity._22 = identity._33 = identity._44 = 1.0f;
-		SetQueryStates(device, identity, identity);   // the same calls as each frame, with valid values
-		device->SetStreamSource(0, nullptr, 0, 0);    // DrawPrimitiveUP clears stream 0; the block puts it back
-		ok = SUCCEEDED(device->EndStateBlock(&gState)) && gState;
+	void Set(int i, DWORD value) {
+		if (now[i] != value) { device->SetRenderState(type[i], value); now[i] = value; }
 	}
-	all->Apply();
-	all->Release();
-	if (!ok) Log("Could not record the state block: queries off");
-	return ok;
-}
+
+	// False (and nothing changed) when alpha testing is on: it would cut box pixels and must not be touched.
+	bool Enter(IDirect3DDevice9* d, bool depthGrows) {
+		DWORD alphaTest = FALSE;
+		if (FAILED(d->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest)) || alphaTest) return false;
+		device = d;
+		for (int i = 0; i < kStates; ++i) { device->GetRenderState(type[i], &saved[i]); now[i] = saved[i]; }
+		device->GetRenderState(D3DRS_CULLMODE, &cull);
+		device->GetVertexShader(&vs);
+		device->GetPixelShader(&ps);
+		device->GetVertexDeclaration(&decl);
+		device->GetFVF(&fvf);
+		device->GetStreamSource(0, &vb, &offset, &stride);
+		active = true;
+		for (int i = 0; i < 4; ++i) Set(i, 0);            // no colour writes
+		Set(4, D3DZB_TRUE);
+		Set(5, FALSE);                                      // no depth writes
+		const DWORD z = now[6];
+		const bool sameWay = depthGrows ? (z == D3DCMP_LESS || z == D3DCMP_LESSEQUAL) : (z == D3DCMP_GREATER || z == D3DCMP_GREATEREQUAL);
+		if (!sameWay) Set(6, depthGrows ? D3DCMP_LESSEQUAL : D3DCMP_GREATEREQUAL);
+		Set(7, FALSE);
+		Set(8, FALSE);
+		if (cull != D3DCULL_NONE) device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+		device->SetVertexShader(nullptr);
+		device->SetPixelShader(nullptr);
+		device->SetFVF(kFVF);
+		return true;
+	}
+
+	void Leave() {
+		if (!active) return;
+		active = false;
+		if (decl) device->SetVertexDeclaration(decl); else device->SetFVF(fvf);
+		device->SetStreamSource(0, vb, offset, stride);
+		device->SetVertexShader(vs);
+		device->SetPixelShader(ps);
+		if (cull != D3DCULL_NONE) device->SetRenderState(D3DRS_CULLMODE, cull);
+		for (int i = 0; i < kStates; ++i) Set(i, saved[i]);
+		if (decl) { decl->Release(); decl = nullptr; }
+		if (vb) { vb->Release(); vb = nullptr; }
+		if (vs) { vs->Release(); vs = nullptr; }
+		if (ps) { ps->Release(); ps = nullptr; }
+	}
+};
+static MinimalStates gStates;
 
 static IDirect3DQuery9* AcquireQuery(IDirect3DDevice9* device) {
 	if (!gFreeQueries.empty()) { IDirect3DQuery9* q = gFreeQueries.back(); gFreeQueries.pop_back(); return q; }
@@ -541,10 +557,13 @@ static __declspec(noinline) void RunQueries(void* camera) {
 	if (canIssue && (FAILED(device->GetDepthStencilSurface(&depth)) || !depth)) { canIssue = false; gStats.noDepth += 1; }
 	if (depth) depth->Release();
 
-	if (canIssue && !gCandidates.empty() && EnsureStateBlock(device)) {
+	const bool noDraw = gDiag == 3;
+	if (canIssue && !gCandidates.empty()) {
 		gDepthGrows = OcclusionMath::DepthGrowsWithDistance(&proj._11);
-		gState->Capture();
-		SetQueryStates(device, view, proj);
+		// Boxes are only tested when they can be drawn: an undrawn query would answer 0 pixels and hide its object.
+		if (!noDraw && !gStates.Enter(device, gDepthGrows)) { gStats.alphaTestFrames += 1; canIssue = false; }
+	}
+	if (canIssue && !gCandidates.empty()) {
 		// Who is tested this frame, in what order (Scheduler.h).
 		static std::vector<Scheduler::Item> order;
 		order.clear();
@@ -558,16 +577,22 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		}
 		Scheduler::Order(order);
 
+		D3DVIEWPORT9 vp = {};
+		device->GetViewport(&vp);
 		OcclusionMath::Vertex box[36];
+		OcclusionMath::ScreenVertex screen[36];
 		int issued = 0;
 		for (const Scheduler::Item& item : order) {
 			if (issued >= gSet.maxQueries) { gStats.budgetSkips += 1; continue; }
 			Record& rec = *gCandidates[item.index].rec;
+			OcclusionMath::BoxTriangles(rec.mn, rec.mx, posAdjust, 0xFFFFFFFF, box);
+			const bool drawable = noDraw || OcclusionMath::ProjectToScreen(box, 36, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
+				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, screen);
+			if (!drawable) { rec.issued = gFrame; gStats.behindCamera += 1; continue; }   // reaches behind the camera: drawn
 			if (!rec.query) rec.query = AcquireQuery(device);
 			if (!rec.query) break;
-			OcclusionMath::BoxTriangles(rec.mn, rec.mx, posAdjust, 0xFFFFFFFF, box);
 			rec.query->Issue(D3DISSUE_BEGIN);
-			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, box, sizeof(OcclusionMath::Vertex));
+			if (!noDraw) device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
 			rec.query->Issue(D3DISSUE_END);
 			rec.pending = true;
 			rec.issued = gFrame;
@@ -578,19 +603,20 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		}
 		gStats.issued += issued;
 
-		if (gSet.debugBoxes) {
-			device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
-			device->SetRenderState(D3DRS_FILLMODE, D3DFILL_WIREFRAME);
+		if (gSet.debugBoxes && !noDraw) {
+			gStates.Set(0, 0xF);   // colour into the first target only
 			for (const Candidate& c : gCandidates) {
 				const Record& rec = *c.rec;
 				if (!rec.answered) continue;
-				device->SetRenderState(D3DRS_ZENABLE, c.wouldHide ? D3DZB_FALSE : D3DZB_TRUE);
+				gStates.Set(4, c.wouldHide ? D3DZB_FALSE : D3DZB_TRUE);
 				OcclusionMath::BoxTriangles(rec.mn, rec.mx, posAdjust, c.wouldHide ? 0xFFFF2020 : 0xFF20FF20, box);
-				device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, box, sizeof(OcclusionMath::Vertex));
+				if (OcclusionMath::ProjectToScreen(box, 36, &view._11, &proj._11, (float)vp.X, (float)vp.Y, (float)vp.Width,
+					(float)vp.Height, vp.MinZ, vp.MaxZ, screen))
+					device->DrawPrimitiveUP(D3DPT_LINELIST, 18, screen, sizeof(OcclusionMath::ScreenVertex));
 			}
 		}
-		gState->Apply();
 	}
+	gStates.Leave();
 
 	// 3. Forget objects not drawn for a while.
 	if (gFrame % 64 == 0) {
@@ -610,7 +636,7 @@ static __declspec(noinline) void RunQueries(void* camera) {
 static void SafeRunQueries(void* camera) {
 	__try { RunQueries(camera); }
 	__except (EXCEPTION_EXECUTE_HANDLER) {
-		if (gState) gState->Apply();
+		gStates.Leave();
 		OnFault("the query pass");
 	}
 }
@@ -656,8 +682,9 @@ static void LogBlock() {
 		gStats.answered > 0 ? gStats.ageSum / gStats.answered : 0.0, gStats.notReady / f, gStats.failed / f, gStats.budgetSkips / f,
 		gStats.records / f);
 	Log("  cost per frame: %.0f us collecting, %.0f us queries (CPU) | frames skipped: %.0f camera mismatch, %.0f no depth "
-		"buffer | identity resets %.0f", gStats.collectUs / f, gStats.queryUs / f, gStats.camMismatch, gStats.noDepth,
-		gStats.identityResets);
+		"buffer, %.0f alpha testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
+		gStats.collectUs / f, gStats.queryUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
+		gStats.behindCamera / f, gStats.identityResets);
 	gStats = Stats{};
 }
 
@@ -690,7 +717,7 @@ static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 
 static void __fastcall FadeOnVisibleHook(void* node, void*, void* culler) {
 	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread) {
-		if (gFadeDepth == 0 && SafeCollect(node) && gCullingOn && !gFaulted) return;   // proven covered: not drawn
+		if (gFadeDepth == 0 && SafeCollect(node) && gCullingOn && !gFaulted && gDiag == 0) return;   // proven covered: not drawn
 		++gFadeDepth;
 		OrigFadeOnVisible(node, culler);
 		--gFadeDepth;
@@ -730,7 +757,15 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		gToggleMessage = true;
 		Log("[frame %u] hiding switched %s with the key", gFrame, gCullingOn ? "ON" : "OFF");
 	}
-	SafeRunQueries(camera);
+	if (gSet.diagnosticKey && controls && !Game::IsInMenuMode() &&
+		Game::GetKeyboardButton(controls, gSet.diagnosticKey, Game::KeyPressed)) {
+		static const int kNext[4] = { 1, 3, 0, 0 };   // 0 -> 1 -> 3 -> 0
+		gDiag = kNext[gDiag];
+		ReleaseAll();   // answers from another mode must not decide anything
+		gDiagMessage = true;
+		Log("[frame %u] %s", gFrame, kDiagNames[gDiag]);
+	}
+	if (gDiag != 1) SafeRunQueries(camera);
 	gStats.queryUs += MicrosSince(start);
 	gCandidates.clear();
 	gMainCamera = nullptr;   // one query pass per main accumulate
@@ -741,6 +776,10 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	++gFrame;
 	gStats.frames += 1;
 	if (gStats.frames >= gSet.logInterval) LogBlock();
+	if (gDiagMessage) {
+		gDiagMessage = false;
+		Game::ShowMessage(kDiagNames[gDiag], 0, nullptr, nullptr, 2.0f, true);
+	}
 	if (gToggleMessage) {
 		gToggleMessage = false;
 		Game::ShowMessage(gCullingOn ? "Occlusion culling: ON" : "Occlusion culling: OFF (measuring only)", 0, nullptr, nullptr,
@@ -768,6 +807,8 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	Log("Hooks installed: main accumulate -> 0x%08X, main opaque pass -> 0x%08X, BSFadeNode::OnVisible -> 0x%08X",
 		(unsigned)(uintptr_t)OrigAccumulate, (unsigned)(uintptr_t)OrigOpaque, (unsigned)(uintptr_t)OrigFadeOnVisible);
 	gCullingOn = gSet.culling;
+	gDiag = gSet.diagnosticStart;
+	if (gDiag) Log("Starting in %s", kDiagNames[gDiag]);
 	Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 		gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
 }
@@ -782,7 +823,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.2.1 (phase 2: hiding covered objects, hotkey on/off; covered objects tested first)");
+	Log("Occlusion Culling 0.3.0 (boxes drawn with minimal state changes, no state blocks)");
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);

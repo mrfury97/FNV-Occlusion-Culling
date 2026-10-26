@@ -20,11 +20,15 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 
 - **Finding the objects.** While the game gathers the main view (`TESMain::DrawScene` 0x873200, its `BSShaderUtil::AccumulateScene` call at 0x87415B), each placed object's root `BSFadeNode` is checked in `OnVisible` (vtable slot 53). Large objects become candidates.
 - **Never touched:** actors, doors, lights, activators, terminals, projectiles and anything near the camera. Small objects and distant LOD are optional (see the INI).
-- **Asking the GPU.** Right after the opaque pass (the `RenderScenePreResolveDepth` call at 0x874180), the depth buffer holds the finished scene. Each candidate's box (the union of its shapes' bounds) is drawn there inside a D3D9 occlusion query, with colour and depth writes off. It uses the renderer's own camera-relative view and projection, and the depth direction is detected automatically (NVR uses reversed depth). Answers are read a frame later without waiting.
+- **Asking the GPU.** Right after the opaque pass (the `RenderScenePreResolveDepth` call at 0x874180), the depth buffer holds the finished scene. Each candidate's box (the union of its shapes' bounds) is drawn there inside a D3D9 occlusion query, with colour and depth writes off.
+  - **Projection:** the boxes are projected on the CPU with the renderer's own camera-relative view and projection, and drawn as pre-transformed vertices. Boxes reaching behind the camera aren't tested.
+  - **Depth direction:** detected automatically (NVR uses reversed depth).
+  - **Answers:** read a frame later without waiting.
 - **Hiding.** An object is left out of the main view only when its last two answers drew zero pixels, the newest is at most 4 frames old, and the camera hasn't turned or moved too far since. Shadows, reflections and every other pass still draw it.
 - **Scheduling.** Covered objects are retested every frame so they reappear promptly. Visible objects are retested every few frames. The per-frame budget goes to whoever has waited longest (`src/Scheduler.h`).
 - **Safety.**
-  - Every D3D state the plugin touches is restored from a recorded state block.
+  - Only a few device states are changed: colour writes, depth write/test, culling, scissor/stencil when on, shaders, vertex format and stream 0. Each is read first and set back to exactly that value.
+  - No state blocks are used. Re-sending states (a full snapshot, or toggling alpha testing) disturbs NVIDIA's alpha-to-coverage driver hack, which the game uses with `bTransparencyMultisampling` and MSAA. That left a dithered speckle on most surfaces until restart. Alpha testing is never touched: if it's on at that point, nothing is tested that frame.
   - Hooks chain to anything already there.
   - Any exception switches the plugin off for the session.
   - A device reset drops all queries.
@@ -52,6 +56,7 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 | `iVisibleRetestFrames` | 4 | How often visible objects are retested |
 | `fGuardDegreesPerFrame` / `fGuardUnitsPerFrame` | 2.5 / 32 | Camera turn/move per frame of answer age beyond which answers aren't used |
 | `bDebugBoxes` | 0 | Draws the tested boxes (green visible, red hidden) |
+| `iDiagnosticKey` / `iDiagnosticStart` | 0 / 0 | Test modes for tracking down rendering problems (key cycles them; start mode) |
 
 ## Tests
 
