@@ -63,6 +63,68 @@ namespace OcclusionMath {
 		return true;
 	}
 
+	// A box's 8 corners, in the order BoxTriangles uses (bit 0 = x max, bit 1 = y max, bit 2 = z max as in kCorner).
+	static const int kCorner[8][3] = { { 0, 0, 0 }, { 1, 0, 0 }, { 1, 1, 0 }, { 0, 1, 0 },
+	                                   { 0, 0, 1 }, { 1, 0, 1 }, { 1, 1, 1 }, { 0, 1, 1 } };
+
+	inline void AxisCorners(const float* mn, const float* mx, float (*out)[3]) {
+		for (int k = 0; k < 8; ++k)
+			for (int i = 0; i < 3; ++i) out[k][i] = kCorner[k][i] ? mx[i] : mn[i];
+	}
+
+	// Oriented box: local box [lmn, lmx] placed by rotation rot (row-major 3x3, world = rot * local, as NiMatrix3) at org.
+	inline void OrientedCorners(const float* rot, const float* org, const float* lmn, const float* lmx, float (*out)[3]) {
+		for (int k = 0; k < 8; ++k) {
+			const float l[3] = { kCorner[k][0] ? lmx[0] : lmn[0], kCorner[k][1] ? lmx[1] : lmn[1], kCorner[k][2] ? lmx[2] : lmn[2] };
+			for (int i = 0; i < 3; ++i) out[k][i] = org[i] + rot[i * 3 + 0] * l[0] + rot[i * 3 + 1] * l[1] + rot[i * 3 + 2] * l[2];
+		}
+	}
+
+	// World point into the oriented box's frame: rot^T * (p - org).
+	inline void ToLocal(const float* rot, const float* org, const float* p, float* out) {
+		const float d[3] = { p[0] - org[0], p[1] - org[1], p[2] - org[2] };
+		for (int i = 0; i < 3; ++i) out[i] = rot[0 * 3 + i] * d[0] + rot[1 * 3 + i] * d[1] + rot[2 * 3 + i] * d[2];
+	}
+
+	// The axis-aligned box holding box [a, b] after x -> m * x + o (m row-major 3x3): centre moved, half sizes |m| * half.
+	inline void TransformedBox(const float* m, const float* o, const float* a, const float* b, float* mn, float* mx) {
+		const float c[3] = { (a[0] + b[0]) * 0.5f, (a[1] + b[1]) * 0.5f, (a[2] + b[2]) * 0.5f };
+		const float e[3] = { (b[0] - a[0]) * 0.5f, (b[1] - a[1]) * 0.5f, (b[2] - a[2]) * 0.5f };
+		for (int i = 0; i < 3; ++i) {
+			const float* r = m + i * 3;
+			const float ci = o[i] + r[0] * c[0] + r[1] * c[1] + r[2] * c[2];
+			const float ei = std::fabs(r[0]) * e[0] + std::fabs(r[1]) * e[1] + std::fabs(r[2]) * e[2];
+			mn[i] = ci - ei;
+			mx[i] = ci + ei;
+		}
+	}
+
+	inline float BoxVolume(const float* mn, const float* mx) {
+		return (mx[0] - mn[0]) * (mx[1] - mn[1]) * (mx[2] - mn[2]);
+	}
+
+	// The 36 triangle-list vertices of a box given by its 8 corners (world), projected like ProjectToScreen.
+	inline bool ProjectCorners(const float (*corners)[3], const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out) {
+		static const int tri[12][3] = { { 0, 2, 1 }, { 0, 3, 2 }, { 4, 5, 6 }, { 4, 6, 7 }, { 0, 1, 5 }, { 0, 5, 4 },
+		                                { 3, 6, 2 }, { 3, 7, 6 }, { 0, 4, 7 }, { 0, 7, 3 }, { 1, 2, 6 }, { 1, 6, 5 } };
+		Vertex c[8];
+		for (int k = 0; k < 8; ++k) c[k] = { corners[k][0] - origin[0], corners[k][1] - origin[1], corners[k][2] - origin[2], color };
+		ScreenVertex s[8];
+		if (!ProjectToScreen(c, 8, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, s)) return false;
+		for (int t = 0; t < 12; ++t)
+			for (int i = 0; i < 3; ++i) out[t * 3 + i] = s[tri[t][i]];
+		return true;
+	}
+
+	// The same as BoxTriangles + ProjectToScreen, projecting only the 8 corners (the 36 vertices are copies of them).
+	inline bool ProjectBox(const float* mn, const float* mx, const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out) {
+		float corners[8][3];
+		AxisCorners(mn, mx, corners);
+		return ProjectCorners(corners, origin, view, proj, vpX, vpY, vpW, vpH, minZ, maxZ, color, out);
+	}
+
 	// Distance from p to the nearest point of the box (0 inside).
 	inline float DistanceToBox(const float* p, const float* mn, const float* mx) {
 		float d2 = 0.0f;
@@ -71,5 +133,11 @@ namespace OcclusionMath {
 			d2 += v * v;
 		}
 		return std::sqrt(d2);
+	}
+
+	inline float DistanceToOrientedBox(const float* p, const float* rot, const float* org, const float* lmn, const float* lmx) {
+		float l[3];
+		ToLocal(rot, org, p, l);
+		return DistanceToBox(l, lmn, lmx);
 	}
 }

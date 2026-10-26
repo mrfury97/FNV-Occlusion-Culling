@@ -56,11 +56,13 @@ The gain is largest where the CPU is busy sending draw calls for things you can'
 | `iVisibleRetestFrames` | 4 | How often visible objects are retested |
 | `fGuardDegreesPerFrame` / `fGuardUnitsPerFrame` | 2.5 / 32 | Camera turn/move per frame of answer age beyond which answers aren't used |
 | `bDebugBoxes` | 0 | Draws the tested boxes (green visible, red hidden) |
-| `iDiagnosticKey` / `iDiagnosticStart` | 0 / 0 | Test modes for tracking down rendering problems (key cycles them; start mode) |
+| `bActorCulling` / `fActorMargin` | 1 / 24 | NPCs and creatures (not the player) are hidden when proven covered, only while still inside the box that was tested (bound + 10% + margin). Animation, AI and shadows carry on as when they are outside the view |
+| `bOrientedBoxes` | 1 | Tighter boxes: each shape's own vertices give its extent, and the box follows the object's rotation. Shapes whose vertices the game has freed keep their bound spheres; animated objects keep the old box |
+| `iCompareKey` | 207 (End) | Switches one feature at a time against your settings (as set, actors switched, oriented boxes switched); the log starts a new block at each press |
 
 ## Tests
 
-`tests\build_test.bat` runs the maths checks. `tests\build_sched.bat` runs the scheduler simulation (fort, open street, camera turning, over budget).
+`tests\build_test.bat` runs the maths checks (including oriented boxes). `tests\build_sched.bat` runs the scheduler simulation (fort, open street, camera turning, over budget).
 
 ## Credits
 

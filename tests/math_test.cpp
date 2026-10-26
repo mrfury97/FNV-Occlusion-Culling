@@ -91,6 +91,15 @@ int main() {
 		OcclusionMath::Vertex t2[36];
 		OcclusionMath::BoxTriangles(bmn2, bmx2, cam, 0xFFFFFFFF, t2);
 		CHECK(!OcclusionMath::ProjectToScreen(t2, 36, v, p, 0, 0, 1920, 1080, 0, 1, sv), "box reaching behind the camera accepted");
+		// ProjectBox (8 corners) gives exactly the vertices of BoxTriangles + ProjectToScreen.
+		OcclusionMath::ScreenVertex sb[36];
+		OcclusionMath::ProjectToScreen(tri, 36, v, p, 0, 0, 1920, 1080, 0, 1, sv);   // sv again: the refused box above overwrote part of it
+		CHECK(OcclusionMath::ProjectBox(mn, mx, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, sb), "ProjectBox refused the box ahead");
+		bool same = true;
+		for (int k = 0; k < 36; ++k)
+			same = same && sb[k].x == sv[k].x && sb[k].y == sv[k].y && sb[k].z == sv[k].z && sb[k].rhw == sv[k].rhw;
+		CHECK(same, "ProjectBox differs from BoxTriangles + ProjectToScreen");
+		CHECK(!OcclusionMath::ProjectBox(bmn2, bmx2, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, sb), "ProjectBox accepted a box behind the camera");
 	}
 
 	// Rotation angle: identity vs itself 0, vs a 10 degree yaw 10.
@@ -100,6 +109,81 @@ int main() {
 	CHECK(std::fabs(OcclusionMath::RotationAngleDegrees(I, I)) < 0.05f, "identity angle");
 	CHECK(std::fabs(OcclusionMath::RotationAngleDegrees(I, Z) - 10.0f) < 0.05f, "10 degree angle %.3f",
 		OcclusionMath::RotationAngleDegrees(I, Z));
+
+	// Oriented boxes: a 30 degree yaw (world = R * local, R row-major as NiMatrix3).
+	{
+		const float a = 30 * 0.0174533f, ca = std::cos(a), sa = std::sin(a);
+		const float R[9] = { ca, -sa, 0, sa, ca, 0, 0, 0, 1 };
+		const float org[3] = { 1000, 2000, 300 };
+		const float lmn[3] = { -400, -20, 0 }, lmx[3] = { 400, 20, 300 };   // a long thin wall
+		float corners[8][3];
+		OcclusionMath::OrientedCorners(R, org, lmn, lmx, corners);
+		// Each corner back in the local frame is a corner of [lmn, lmx].
+		bool back = true;
+		for (int k = 0; k < 8; ++k) {
+			float l[3];
+			OcclusionMath::ToLocal(R, org, corners[k], l);
+			for (int i = 0; i < 3; ++i)
+				back = back && std::fabs(l[i] - (OcclusionMath::kCorner[k][i] ? lmx[i] : lmn[i])) < 0.01f;
+		}
+		CHECK(back, "oriented corners do not map back to the local box");
+		// Corner 1 (x max) is the wall's end: org + R * (400, -20, 0).
+		CHECK(std::fabs(corners[1][0] - (org[0] + ca * 400 + sa * 20)) < 0.01f && std::fabs(corners[1][1] - (org[1] + sa * 400 - ca * 20)) < 0.01f,
+			"corner 1 at (%.2f, %.2f)", corners[1][0], corners[1][1]);
+		// Distance: from the wall's middle, 100 units out along its local y, is 80.
+		const float local[3] = { 0, 100, 150 };
+		const float p[3] = { org[0] + R[0] * local[0] + R[1] * local[1], org[1] + R[3] * local[0] + R[4] * local[1], org[2] + local[2] };
+		CHECK(std::fabs(OcclusionMath::DistanceToOrientedBox(p, R, org, lmn, lmx) - 80.0f) < 0.01f, "oriented distance %.3f",
+			OcclusionMath::DistanceToOrientedBox(p, R, org, lmn, lmx));
+		// The oriented box is far smaller than the world-axis box around it.
+		float wmn[3], wmx[3];
+		OcclusionMath::TransformedBox(R, org, lmn, lmx, wmn, wmx);
+		CHECK(OcclusionMath::BoxVolume(lmn, lmx) < 0.25f * OcclusionMath::BoxVolume(wmn, wmx), "oriented box not smaller");
+		// TransformedBox holds every transformed corner, and touches the extremes.
+		bool holds = true;
+		float emn[3] = { 1e30f, 1e30f, 1e30f }, emx[3] = { -1e30f, -1e30f, -1e30f };
+		for (int k = 0; k < 8; ++k)
+			for (int i = 0; i < 3; ++i) {
+				holds = holds && corners[k][i] >= wmn[i] - 0.01f && corners[k][i] <= wmx[i] + 0.01f;
+				emn[i] = corners[k][i] < emn[i] ? corners[k][i] : emn[i];
+				emx[i] = corners[k][i] > emx[i] ? corners[k][i] : emx[i];
+			}
+		for (int i = 0; i < 3; ++i) holds = holds && std::fabs(emn[i] - wmn[i]) < 0.01f && std::fabs(emx[i] - wmx[i]) < 0.01f;
+		CHECK(holds, "TransformedBox is not the transformed corners' extent");
+		// Scaled shape inside the object: x -> R^T * (R_g * 2 * x + t_g - org), as WalkShapes composes it.
+		const float Rg[9] = { ca, -sa, 0, sa, ca, 0, 0, 0, 1 };   // same rotation as the root: no growth expected
+		const float tg[3] = { 1100, 2050, 300 }, amn[3] = { -10, -5, 0 }, amx[3] = { 10, 5, 50 };
+		float mw[9], ml[9], ol[3], smn[3], smx[3];
+		for (int k = 0; k < 9; ++k) mw[k] = Rg[k] * 2.0f;
+		for (int i = 0; i < 3; ++i)
+			for (int j = 0; j < 3; ++j) ml[i * 3 + j] = R[0 * 3 + i] * mw[0 * 3 + j] + R[1 * 3 + i] * mw[1 * 3 + j] + R[2 * 3 + i] * mw[2 * 3 + j];
+		OcclusionMath::ToLocal(R, org, tg, ol);
+		OcclusionMath::TransformedBox(ml, ol, amn, amx, smn, smx);
+		CHECK(std::fabs((smx[0] - smn[0]) - 40) < 0.01f && std::fabs((smx[1] - smn[1]) - 20) < 0.01f && std::fabs((smx[2] - smn[2]) - 100) < 0.01f,
+			"aligned scaled shape grew: %.2f x %.2f x %.2f", smx[0] - smn[0], smx[1] - smn[1], smx[2] - smn[2]);
+		// and its local box, placed back in the world, holds the shape's world corners
+		float sc[8][3], wc[8][3];
+		OcclusionMath::OrientedCorners(R, org, smn, smx, sc);
+		OcclusionMath::AxisCorners(amn, amx, wc);
+		bool inside = true;
+		for (int k = 0; k < 8; ++k) {
+			float w[3], l[3];
+			for (int i = 0; i < 3; ++i) w[i] = tg[i] + mw[i * 3 + 0] * wc[k][0] + mw[i * 3 + 1] * wc[k][1] + mw[i * 3 + 2] * wc[k][2];
+			OcclusionMath::ToLocal(R, org, w, l);
+			for (int i = 0; i < 3; ++i) inside = inside && l[i] >= smn[i] - 0.01f && l[i] <= smx[i] + 0.01f;
+		}
+		CHECK(inside, "shape corner outside its local box");
+		// ProjectCorners of an identity-rotated box equals ProjectBox.
+		const float I3[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 }, zero[3] = { 0, 0, 0 };
+		float ic[8][3];
+		OcclusionMath::OrientedCorners(I3, zero, mn, mx, ic);
+		OcclusionMath::ScreenVertex s1[36], s2[36];
+		CHECK(OcclusionMath::ProjectCorners(ic, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, s1) &&
+			OcclusionMath::ProjectBox(mn, mx, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, s2), "identity corners refused");
+		bool same = true;
+		for (int k = 0; k < 36; ++k) same = same && s1[k].x == s2[k].x && s1[k].y == s2[k].y && s1[k].z == s2[k].z;
+		CHECK(same, "ProjectCorners(identity) differs from ProjectBox");
+	}
 
 	// Distance to box.
 	const float bmn[3] = { 0, 0, 0 }, bmx[3] = { 10, 10, 10 };

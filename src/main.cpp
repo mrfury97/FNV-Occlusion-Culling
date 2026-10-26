@@ -31,6 +31,30 @@
 //     with bTransparencyMultisampling and MSAA, and left a dithered speckle on most surfaces until the game restarted.
 //     Alpha testing is never touched: when it is on at that point, no box is tested that frame.
 // Hooks chain to whatever was there (NVR's F10 CPU profiler patches the same two calls when switched on, and chains).
+//
+// Tighter boxes ([Boxes] bOrientedBoxes): each shape's own vertices (NiGeometryData m_pkVertex, model space) give its
+// exact extent, measured once per mesh and cached. The object's box is then built twice, in the object's own rotated
+// frame (an oriented box: a wall placed at 30 degrees gets a box along the wall) and along the world axes, and the
+// smaller of these and the old box is used. Every box holds the whole object, so answers stay valid when it changes.
+// Shapes whose vertices the game has freed after upload, skinned shapes and particles keep their bound spheres;
+// objects with animation controllers keep the old box. iCompareKey switches actors or oriented boxes off, one at a time,
+// for comparisons (0.5.0 also had grouped tests, one query for several covered objects: removed in 0.7.0, no gain).
+//
+// Actors ([Actors] bActorCulling): NPCs and creatures (not the player, not severed limbs) are tested too. Skipping an
+// actor's BSFadeNode::OnVisible is exactly what the engine does when the actor is outside the view: fade, animation, AI
+// and BSFadeNode::IsVisible do not depend on it (checked in the decompile). An actor moves, so its box is rebuilt every
+// frame from the root's world bound (the sphere the engine itself culls with) plus a margin (10% + fActorMargin), and it
+// is hidden only while its current bound still lies inside the box its newest 0-pixel answer was for. The margin
+// shows pixels before the actor itself steps out from behind a wall.
+//
+// Hidden lamps ([Lamps]): every frame ShadowSceneNode::PreOnVisible runs ShadowSceneLight::TestFrustumCull (call at
+// 0xB5E915, also patched by NVR's KeepLampsInView, which we chain) on each lamp; usFrustumCull (+0x110) = 255 switches
+// the lamp off for that frame, and the game marks the shaders of every shape the lamp lights (kGeometries +0xE0,
+// bLightListChanged) to rebuild their lamp passes when that changes. Each lamp's reach (a box around its radius,
+// NiLight m_kSpec.r) is tested with the same occlusion queries: when no visible pixel lies inside it, nothing the lamp
+// could light is on screen. Measured always; with bLampCulling=1 such a lamp is also switched off for the main view
+// (after three 0-pixel answers, the camera guard as for objects, never within fNearDistance of the camera), with the
+// value the game and NVR left restored before each next test and the lit shapes marked to rebuild when ours changes.
 
 #include <windows.h>
 #include <d3d9.h>
@@ -77,8 +101,11 @@ struct Settings {
 	bool culling = true;             // start with hiding on
 	int toggleKey = 0xD2;            // DirectInput scancode of the on/off key (Insert)
 	bool distantLOD = false;         // also test distant LOD objects
-	int diagnosticKey = 0;           // cycles the test modes below (0 = no key)
-	int diagnosticStart = 0;         // test mode from the first frame (0-3)
+	bool lampCulling = false;        // switch hidden lamps off (otherwise they are only measured)
+	bool orientedBoxes = true;       // tighter boxes from the shapes' vertices, in the object's own frame
+	int compareKey = 0xCF;           // switches actors, then oriented boxes, off for comparisons (End)
+	bool actorCulling = true;        // NPCs and creatures are tested and hidden too
+	float actorMargin = 24.0f;       // added around an actor's bound (plus 10% of its radius)
 } gSet;
 
 static void LoadSettings() {
@@ -108,9 +135,15 @@ static void LoadSettings() {
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
 	gSet.toggleKey = readI("General", "iToggleKey", 0xD2, 0, 255);
 	gSet.distantLOD = readI("Candidates", "bDistantLOD", 0, 0, 1) != 0;
-	gSet.diagnosticKey = readI("Debug", "iDiagnosticKey", 0, 0, 255);
-	gSet.diagnosticStart = readI("Debug", "iDiagnosticStart", 0, 0, 3);
-	if (gSet.diagnosticStart == 2) gSet.diagnosticStart = 0;
+	gSet.lampCulling = readI("Lamps", "bLampCulling", 0, 0, 1) != 0;
+	gSet.orientedBoxes = readI("Boxes", "bOrientedBoxes", 1, 0, 1) != 0;
+	gSet.compareKey = readI("Debug", "iCompareKey", 0xCF, 0, 255);
+	gSet.actorCulling = readI("Actors", "bActorCulling", 1, 0, 1) != 0;
+	gSet.actorMargin = readF("Actors", "fActorMargin", 24.0f, 0.0f, 512.0f);
+	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
+		gSet.actorMargin);
+	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
+	Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
 	Log("Settings: enabled %d, hiding %s at start, on/off key 0x%02X | candidates: radius >= %.0f, box farther than %.0f, "
 		"distant LOD %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
 		"%.0f units per frame | log every %d frames, debug boxes %d", gSet.enabled, gSet.culling ? "on" : "off", gSet.toggleKey,
@@ -151,6 +184,13 @@ namespace Game {
 	constexpr uintptr_t Fade_LinkedRef = 0xCC;      // TESObjectREFR* pLinkedObj
 	constexpr uintptr_t RTTI_NiNode = 0x011F4428;
 	constexpr uintptr_t RTTI_NiGeometry = 0x011F4ACC;
+	constexpr uintptr_t RTTI_NiTriBasedGeom = 0x011F5B70;   // NiTriShape, NiTriStrips and the BS shapes derived from them
+	constexpr uintptr_t Obj_Controllers = 0x0C;     // NiObjectNET::m_spControllers
+	constexpr uintptr_t Geo_ModelData = 0xB8;       // NiGeometry::m_spModelData (NiGeometryData*)
+	constexpr uintptr_t Geo_SkinInstance = 0xBC;    // NiGeometry::m_spSkinInstance
+	constexpr uintptr_t Data_Vertices = 0x08;       // NiGeometryData::m_usVertices
+	constexpr uintptr_t Data_Bound = 0x10;          // NiGeometryData::m_kBound (model space: centre, radius)
+	constexpr uintptr_t Data_Vertex = 0x20;         // NiGeometryData::m_pkVertex (model space; freed after upload for some)
 	constexpr int VSlot_GetRTTI = 2;
 
 	enum FormType : uint8_t {
@@ -162,6 +202,18 @@ namespace Game {
 	constexpr uintptr_t Call_MainAccumulate = 0x0087415B;   // TESMain::DrawScene -> BSShaderUtil::AccumulateScene 0xB6BEE0
 	constexpr uintptr_t Call_MainOpaque = 0x00874180;       // TESMain::DrawScene -> RenderScenePreResolveDepth 0xB6BA20
 	constexpr uintptr_t Vtbl_FadeOnVisible = 0x010A9064;    // BSFadeNode vtable slot 53 -> BSFadeNode::OnVisible 0xB4E490
+	constexpr uintptr_t Call_LampTest = 0x00B5E915;         // ShadowSceneNode::PreOnVisible -> ShadowSceneLight::TestFrustumCull 0xB9E970
+
+	// ShadowSceneLight / NiLight / shapes (IDA local types)
+	constexpr uintptr_t SSL_Geometries = 0xE0;     // NiTListBase<NiTriStrips>: head +0, count +8
+	constexpr uintptr_t SSL_PointLight = 0xF4;     // bool
+	constexpr uintptr_t SSL_Light = 0xF8;          // NiLight*
+	constexpr uintptr_t SSL_FrustumCull = 0x110;   // UInt16, 255 = off this frame
+	constexpr uintptr_t Light_SpecR = 0xE0;        // NiLight::m_kSpec.r = radius
+	constexpr uintptr_t Geo_ShadeProperty = 0xA8;  // NiGeometry m_kProperties (+0x9C) . m_spShadeProperty (+0xC)
+	constexpr uintptr_t Shade_Type = 0x1C;         // NiShadeProperty::iShaderPropertyType (lighting properties 1-12)
+	constexpr uintptr_t Shade_LightListChanged = 0x74;   // BSShaderLightingProperty::bLightListChanged
+	constexpr uintptr_t Culler_Camera = 0x0C;      // NiCullingProcess::m_pkCamera
 
 	constexpr uintptr_t ControlsPtr = 0x011F35CC;   // Controls* (DirectInput state)
 	typedef int(__thiscall* GetKeyboardButton_t)(void*, int, int);
@@ -214,6 +266,15 @@ struct Record {
 	uint32_t pixels = 0;
 	uint8_t zeroStreak = 0;                    // consecutive answers with 0 pixels
 	uint32_t lastSeen = 0;
+	// Objects only:
+	float corner[8][3] = {};                   // the tested box's corners (world); mn/mx then hold it too
+	bool oriented = false;                     // the box is rot * [lmn, lmx] + org
+	float rot[9] = {}, org[3] = {}, lmn[3] = {}, lmx[3] = {};
+	bool boxPartial = false;                   // built with the frame's vertex budget spent: built again later
+	uint32_t boxGen = 0;                       // box mode it was built in (the compare key changes it)
+	bool actor = false;                        // an NPC or creature: box rebuilt every frame
+	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
+	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
 };
 
 struct Candidate {
@@ -222,6 +283,20 @@ struct Candidate {
 };
 
 static std::unordered_map<void*, Record> gRecords;
+
+struct Lamp {
+	Record rec;                    // its reach box (rec.mn/mx) and query answers
+	void* light = nullptr;         // NiLight (identity)
+	uint32_t seenFrame = 0;        // last frame the main view tested it
+	bool decision = false;         // hidden this frame (decided once per frame)
+	bool overrideActive = false;   // we wrote 255 and must put savedCull back before the next test
+	uint16_t savedCull = 0;
+	bool hiddenApplied = false;    // our switch-off as of the last main-view frame (shapes marked when it changes)
+	bool candidate = false;        // tested this frame
+	bool nearCamera = false;
+};
+static std::unordered_map<void*, Lamp> gLamps;
+static std::vector<Lamp*> gLampCandidates;
 static std::vector<Candidate> gCandidates;
 static std::vector<IDirect3DQuery9*> gFreeQueries;
 static bool gQueriesSupported = true;
@@ -236,15 +311,13 @@ static uint32_t gFrame = 1;
 static bool gFaulted = false;
 static bool gCullingOn = true;      // hiding (the hotkey flips it)
 static bool gToggleMessage = false; // show the new state on the HUD after the scene
-// Test modes (iDiagnosticKey cycles them), to find which part of the plugin changes NVR's picture:
-//   0 normal
-//   1 no D3D work at all (hooks and collecting only; nothing hidden)
-//   3 queries issued without drawing anything and without touching any state (nothing hidden)
-static int gDiag = 0;
-static const char* const kDiagNames[4] = {
-	"test mode 0: normal", "test mode 1: no graphics work", "test mode 2: (removed)", "test mode 3: queries without drawing" };
-static bool gDiagMessage = false;
-
+static bool gOrientedOn = true;     // bOrientedBoxes, then the compare key
+static bool gActorsOn = true;       // bActorCulling, then the compare key
+static int gCompareMode = 0;        // 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped
+static uint32_t gBoxGen = 1;        // changes when the box mode does: boxes are built again
+static bool gCompareMessage = false;
+static int gVertexBudget = 0;       // vertices still to be measured this frame
+constexpr int kVertexBudget = 150000;
 // Camera per frame (ring), for the answer guard
 constexpr int kRing = 16;
 static float gCamPos[kRing][3], gCamRot[kRing][9];
@@ -261,9 +334,15 @@ struct Stats {
 	double issuedCovered = 0, issuedNew = 0, issuedVisible = 0, notDue = 0, behindCamera = 0, alphaTestFrames = 0;
 	double camMismatch = 0, noDepth = 0, identityResets = 0;
 	double hidden = 0, hiddenGeoms = 0;                    // actually not drawn (hiding on)
+	double lampsOn = 0, lampsTested = 0, lampsNear = 0, lampsCovered = 0, lampShapes = 0, lampShapesCovered = 0;
+	double lampsOff = 0, lampFlags = 0, lampsWaiting = 0;
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
-	double collectUs = 0, queryUs = 0;
+	double queryUs = 0;
 	double records = 0;
+	double boxesBuilt = 0, boxesOriented = 0, boxesAxisTighter = 0, boxesAnimated = 0, boxesPartial = 0, volumeRatio = 0;
+	double vertexShapes = 0, sphereShapes = 0, oddShapes = 0;
+	double actorSeen = 0, actorCands = 0, actorNear = 0, actorCovered = 0, actorHidden = 0, actorMoved = 0, actorGuard = 0;
+	double actorOld = 0, actorGeoms = 0, actorHiddenGeoms = 0;
 } gStats;
 static LARGE_INTEGER gQpcFreq;
 static bool gDepthGrows = true, gLoggedFirst = false;
@@ -288,11 +367,65 @@ static bool IsKindOf(void* object, uintptr_t rtti) {
 	return false;
 }
 
-struct Shape { float mn[3], mx[3]; int geoms, visited; bool any; };
+struct Shape {
+	float mn[3], mx[3]; int geoms, visited; bool any;   // union of the shapes' world bound cubes
+	// Tighter boxes (rot set): in the root's frame (omn/omx) and along the world axes (wmn/wmx)
+	const float* rot; const float* org;
+	float omn[3], omx[3], wmn[3], wmx[3]; bool tightAny;
+	int vertexShapes, sphereShapes, oddShapes; bool animated, partial;
+};
+
+// A shape's extent in its own (model) space, from its vertices: measured once per mesh data and cached.
+struct ModelBox { const float* verts; uint16_t count; float bound[4]; float mn[3], mx[3]; };
+static std::unordered_map<void*, ModelBox> gModelBoxes;
+
+static bool ShapeModelBox(void* geo, float* mn, float* mx, Shape& s) {
+	if (!IsKindOf(geo, Game::RTTI_NiTriBasedGeom) || Game::At<void*>(geo, Game::Geo_SkinInstance)) return false;
+	void* data = Game::At<void*>(geo, Game::Geo_ModelData);
+	if (!data) return false;
+	const uint16_t n = Game::At<uint16_t>(data, Game::Data_Vertices);
+	const float* v = Game::At<const float*>(data, Game::Data_Vertex);
+	if (!v || !n) return false;
+	const float* bound = &Game::At<float>(data, Game::Data_Bound);
+	auto it = gModelBoxes.find(data);
+	if (it != gModelBoxes.end() && it->second.verts == v && it->second.count == n && !memcmp(it->second.bound, bound, 16)) {
+		for (int i = 0; i < 3; ++i) { mn[i] = it->second.mn[i]; mx[i] = it->second.mx[i]; }
+		return true;
+	}
+	if (gVertexBudget < n) { s.partial = true; return false; }
+	gVertexBudget -= n;
+	for (int i = 0; i < 3; ++i) mn[i] = mx[i] = v[i];
+	for (uint32_t k = 1; k < n; ++k)
+		for (int i = 0; i < 3; ++i) {
+			const float x = v[k * 3 + i];
+			if (x < mn[i]) mn[i] = x;
+			if (x > mx[i]) mx[i] = x;
+		}
+	// The vertices must lie in the data's own bound sphere (the engine computes it from them): anything else is not
+	// what we think it is, and the shape keeps its bound sphere.
+	const float slack = bound[3] * 0.01f + 1.0f;
+	for (int i = 0; i < 3; ++i)
+		if (!(mn[i] >= bound[i] - bound[3] - slack) || !(mx[i] <= bound[i] + bound[3] + slack)) { ++s.oddShapes; return false; }
+	if (gModelBoxes.size() > 50000) gModelBoxes.clear();
+	ModelBox& e = gModelBoxes[data];
+	e.verts = v; e.count = n;
+	memcpy(e.bound, bound, 16);
+	for (int i = 0; i < 3; ++i) { e.mn[i] = mn[i]; e.mx[i] = mx[i]; }
+	return true;
+}
+
+static void Grow(bool& any, float* mn, float* mx, const float* bmn, const float* bmx) {
+	for (int i = 0; i < 3; ++i) {
+		mn[i] = any ? min(mn[i], bmn[i]) : bmn[i];
+		mx[i] = any ? max(mx[i], bmx[i]) : bmx[i];
+	}
+	any = true;
+}
 
 static void WalkShapes(void* object, int depth, Shape& s) {
 	if (!object || depth > 32 || ++s.visited > 4096) return;
 	if (Game::At<uint32_t>(object, Game::Ni_Flags) & 1u) return;   // APP_CULLED: not drawn
+	if (Game::At<void*>(object, Game::Obj_Controllers)) s.animated = true;
 	if (IsKindOf(object, Game::RTTI_NiNode)) {
 		void** children = Game::At<void**>(object, Game::Node_ChildBase);
 		const uint16_t count = Game::At<uint16_t>(object, Game::Node_ChildSize);
@@ -301,17 +434,54 @@ static void WalkShapes(void* object, int depth, Shape& s) {
 		++s.geoms;
 		const float* b = Game::At<const float*>(object, Game::Ni_WorldBound);
 		if (!b || !(b[3] > 0.0f)) return;
-		for (int i = 0; i < 3; ++i) {
-			s.mn[i] = s.any ? min(s.mn[i], b[i] - b[3]) : b[i] - b[3];
-			s.mx[i] = s.any ? max(s.mx[i], b[i] + b[3]) : b[i] + b[3];
+		const float smn[3] = { b[0] - b[3], b[1] - b[3], b[2] - b[3] }, smx[3] = { b[0] + b[3], b[1] + b[3], b[2] + b[3] };
+		Grow(s.any, s.mn, s.mx, smn, smx);
+		if (!s.rot) return;
+		float amn[3], amx[3], wmn[3], wmx[3], lmn[3], lmx[3];
+		if (ShapeModelBox(object, amn, amx, s)) {
+			// world = R_g * (s_g * x) + t_g; in the root's frame: R^T * (world - org)
+			const float* gr = &Game::At<float>(object, Game::Ni_WorldRotate);
+			const float* gt = &Game::At<float>(object, Game::Ni_WorldTranslate);
+			const float gs = Game::At<float>(object, Game::Ni_WorldScale);
+			float mw[9], ml[9], ol[3];
+			for (int k = 0; k < 9; ++k) mw[k] = gr[k] * gs;
+			for (int i = 0; i < 3; ++i)
+				for (int j = 0; j < 3; ++j)
+					ml[i * 3 + j] = s.rot[0 * 3 + i] * mw[0 * 3 + j] + s.rot[1 * 3 + i] * mw[1 * 3 + j] + s.rot[2 * 3 + i] * mw[2 * 3 + j];
+			OcclusionMath::ToLocal(s.rot, s.org, gt, ol);
+			OcclusionMath::TransformedBox(mw, gt, amn, amx, wmn, wmx);
+			OcclusionMath::TransformedBox(ml, ol, amn, amx, lmn, lmx);
+			++s.vertexShapes;
+		} else {
+			float c[3];
+			OcclusionMath::ToLocal(s.rot, s.org, b, c);
+			for (int i = 0; i < 3; ++i) {
+				wmn[i] = smn[i]; wmx[i] = smx[i];
+				lmn[i] = c[i] - b[3]; lmx[i] = c[i] + b[3];
+			}
+			++s.sphereShapes;
 		}
-		s.any = true;
+		bool any = s.tightAny;
+		Grow(any, s.wmn, s.wmx, wmn, wmx);
+		Grow(s.tightAny, s.omn, s.omx, lmn, lmx);
 	}
 }
 
-// The box is the union of the shapes' bound cubes, cut to the node's own bound cube (both contain every shape).
+// The old box is the union of the shapes' bound cubes, cut to the node's own bound cube (both contain every shape).
+// With oriented boxes on, the shapes' measured extents give two more boxes, in the object's frame and along the world
+// axes (each cut to the node's bound too); the smallest box holding the whole object is tested.
 static void RebuildShape(void* node, const float* bound, Record& rec) {
 	Shape s{};
+	const float* rot = &Game::At<float>(node, Game::Ni_WorldRotate);
+	const float* org = &Game::At<float>(node, Game::Ni_WorldTranslate);
+	// The local-frame maths needs a true rotation (rot^T * rot = identity); anything else keeps the old box.
+	bool rotation = true;
+	for (int i = 0; i < 3 && rotation; ++i)
+		for (int j = 0; j < 3; ++j) {
+			const float d = rot[0 * 3 + i] * rot[0 * 3 + j] + rot[1 * 3 + i] * rot[1 * 3 + j] + rot[2 * 3 + i] * rot[2 * 3 + j];
+			if (!(std::fabs(d - (i == j ? 1.0f : 0.0f)) < 0.001f)) { rotation = false; break; }
+		}
+	if (gOrientedOn && rotation) { s.rot = rot; s.org = org; }
 	WalkShapes(node, 0, s);
 	rec.geoms = (uint16_t)min(s.geoms, 65535);
 	for (int i = 0; i < 3; ++i) {
@@ -320,29 +490,122 @@ static void RebuildShape(void* node, const float* bound, Record& rec) {
 		rec.mx[i] = s.any ? min(s.mx[i], hi) : hi;
 		if (rec.mx[i] < rec.mn[i]) { rec.mn[i] = lo; rec.mx[i] = hi; }
 	}
+	rec.oriented = false;
+	rec.boxPartial = s.partial;
+	rec.boxGen = gBoxGen;
+	gStats.boxesBuilt += 1;
+	if (s.partial) gStats.boxesPartial += 1;
+	const float oldVolume = OcclusionMath::BoxVolume(rec.mn, rec.mx);
+	float volume = oldVolume;
+	if (gOrientedOn && s.animated) gStats.boxesAnimated += 1;
+	if (gOrientedOn && s.tightAny && !s.animated) {
+		gStats.vertexShapes += s.vertexShapes;
+		gStats.sphereShapes += s.sphereShapes;
+		gStats.oddShapes += s.oddShapes;
+		float wmn[3], wmx[3], lmn[3], lmx[3], c[3];
+		bool axisOk = true, localOk = true;
+		OcclusionMath::ToLocal(rot, org, bound, c);
+		for (int i = 0; i < 3; ++i) {
+			wmn[i] = max(s.wmn[i], rec.mn[i]); wmx[i] = min(s.wmx[i], rec.mx[i]);
+			lmn[i] = max(s.omn[i], c[i] - bound[3]); lmx[i] = min(s.omx[i], c[i] + bound[3]);
+			axisOk = axisOk && wmn[i] <= wmx[i];
+			localOk = localOk && lmn[i] <= lmx[i];
+		}
+		if (axisOk && OcclusionMath::BoxVolume(wmn, wmx) < volume) {
+			for (int i = 0; i < 3; ++i) { rec.mn[i] = wmn[i]; rec.mx[i] = wmx[i]; }
+			volume = OcclusionMath::BoxVolume(wmn, wmx);
+			gStats.boxesAxisTighter += 1;
+		}
+		if (localOk && OcclusionMath::BoxVolume(lmn, lmx) < volume * 0.98f) {
+			rec.oriented = true;
+			for (int i = 0; i < 9; ++i) rec.rot[i] = rot[i];
+			for (int i = 0; i < 3; ++i) { rec.org[i] = org[i]; rec.lmn[i] = lmn[i]; rec.lmx[i] = lmx[i]; }
+			volume = OcclusionMath::BoxVolume(lmn, lmx);
+			gStats.boxesOriented += 1;
+		}
+	}
+	if (oldVolume > 0.0f) gStats.volumeRatio += volume / oldVolume;
+	else gStats.volumeRatio += 1.0;
+	if (rec.oriented) {
+		OcclusionMath::OrientedCorners(rec.rot, rec.org, rec.lmn, rec.lmx, rec.corner);
+		// mn/mx (groups' unions) = the oriented box's world extent, cut to the axis box: both hold the object
+		float cmn[3], cmx[3];
+		for (int i = 0; i < 3; ++i) { cmn[i] = cmx[i] = rec.corner[0][i]; }
+		for (int k = 1; k < 8; ++k)
+			for (int i = 0; i < 3; ++i) { cmn[i] = min(cmn[i], rec.corner[k][i]); cmx[i] = max(cmx[i], rec.corner[k][i]); }
+		for (int i = 0; i < 3; ++i) { rec.mn[i] = max(rec.mn[i], cmn[i]); rec.mx[i] = min(rec.mx[i], cmx[i]); }
+	} else {
+		OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Collecting (main pass, inside BSFadeNode::OnVisible)
 
 // May the newest answer be used now? Its age in frames, and the camera's turn and move since it was drawn.
-static bool AnswerUsable(const Record& rec, bool& tooOld) {
+static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos, const float* nowRot);
+static bool AnswerUsable(const Record& rec, bool& tooOld) { return AnswerUsableAt(rec, tooOld, gNowPos, gNowRot); }
+static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos, const float* nowRot) {
 	tooOld = false;
 	const uint32_t age = gFrame - rec.answerFrame;
 	if (age < 1 || age > (uint32_t)gSet.maxAnswerAge || age >= kRing) { tooOld = true; return false; }
 	const int slot = rec.answerFrame % kRing;
 	const float* p = gCamPos[slot];
-	const float dx = gNowPos[0] - p[0], dy = gNowPos[1] - p[1], dz = gNowPos[2] - p[2];
+	const float dx = nowPos[0] - p[0], dy = nowPos[1] - p[1], dz = nowPos[2] - p[2];
 	if (std::sqrt(dx * dx + dy * dy + dz * dz) > gSet.guardUnits * age) return false;
-	return OcclusionMath::RotationAngleDegrees(gNowRot, gCamRot[slot]) <= gSet.guardDegrees * age;
+	return OcclusionMath::RotationAngleDegrees(nowRot, gCamRot[slot]) <= gSet.guardDegrees * age;
+}
+
+// NPCs and creatures: box = world bound sphere + margin, every frame; hidden while the current bound is still inside
+// the box of the newest 0-pixel answer (and the camera guard holds, as for objects).
+static bool CollectActor(void* node, void* ref, const float* bound) {
+	Record& rec = gRecords[node];
+	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
+	if (rec.lastSeen == 0 || rec.formID != formID || !rec.actor) {
+		if (rec.lastSeen != 0) gStats.identityResets += 1;
+		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
+		rec.formID = formID;
+		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
+		rec.oriented = false; rec.boxPartial = false;
+		rec.actor = true;
+		Shape s{};
+		WalkShapes(node, 0, s);   // shape count for the log only
+		rec.geoms = (uint16_t)min(s.geoms, 65535);
+	}
+	rec.lastSeen = gFrame;
+	rec.boxGen = gBoxGen;
+	const float r = bound[3], margin = r * 0.1f + gSet.actorMargin;
+	float cmn[3], cmx[3];
+	for (int i = 0; i < 3; ++i) {
+		cmn[i] = bound[i] - r; cmx[i] = bound[i] + r;
+		rec.mn[i] = cmn[i] - margin; rec.mx[i] = cmx[i] + margin;
+	}
+	OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
+	gStats.actorSeen += 1;
+	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { gStats.actorNear += 1; return false; }
+
+	gStats.actorCands += 1;
+	gStats.actorGeoms += rec.geoms;
+	bool hide = false;
+	if (rec.answered && rec.zeroStreak >= 2) {
+		gStats.actorCovered += 1;
+		bool inside = true;
+		for (int i = 0; i < 3; ++i) inside = inside && cmn[i] >= rec.amn[i] && cmx[i] <= rec.amx[i];
+		bool tooOld;
+		if (!inside) gStats.actorMoved += 1;
+		else if (AnswerUsable(rec, tooOld)) hide = true;
+		else if (tooOld) gStats.actorOld += 1;
+		else gStats.actorGuard += 1;
+	}
+	gCandidates.push_back({ &rec, hide });
+	if (hide && gCullingOn) { gStats.actorHidden += 1; gStats.actorHiddenGeoms += rec.geoms; }
+	return hide;
 }
 
 static __declspec(noinline) bool Collect(void* node) {
-	LARGE_INTEGER start;
-	QueryPerformanceCounter(&start);
 	gStats.topFade += 1;
 	void* ref = Game::At<void*>(node, Game::Fade_LinkedRef);
-	if (!ref) { gStats.noRef += 1; gStats.collectUs += MicrosSince(start); return false; }
+	if (!ref) { gStats.noRef += 1; return false; }
 	const uint8_t refType = Game::At<uint8_t>(ref, Game::Form_Type);
 	void* base = Game::At<void*>(ref, Game::Ref_Base);
 	const uint8_t baseType = base ? Game::At<uint8_t>(base, Game::Form_Type) : 0;
@@ -350,6 +613,11 @@ static __declspec(noinline) bool Collect(void* node) {
 	const float* bound = Game::At<const float*>(node, Game::Ni_WorldBound);
 
 	bool skip = true;
+	if (gActorsOn && (refType == Game::kCharacter || refType == Game::kCreature) && mult != Game::kLodBodyPart &&
+		ref != *(void**)Game::PlayerPtr && bound && bound[3] > 0.0f && bound[3] < 10000.0f &&
+		!(Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)) {
+		return CollectActor(node, ref, bound);
+	}
 	if (refType == Game::kCharacter || refType == Game::kCreature || mult == Game::kLodActors || mult == Game::kLodBodyPart)
 		gStats.actors += 1;
 	else if ((refType >= Game::kMissile && refType <= Game::kFlame) || refType == Game::kContBeam || baseType == Game::kDOOR ||
@@ -365,13 +633,13 @@ static __declspec(noinline) bool Collect(void* node) {
 		gStats.culledFlag += 1;
 	else
 		skip = false;
-	if (skip) { gStats.collectUs += MicrosSince(start); return false; }
+	if (skip) return false;
 
 	Record& rec = gRecords[node];
 	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
 	const float* pos = &Game::At<float>(node, Game::Ni_WorldTranslate);
 	const float scale = Game::At<float>(node, Game::Ni_WorldScale);
-	const bool same = rec.lastSeen != 0 && rec.formID == formID && rec.scale == scale && rec.pos[0] == pos[0] &&
+	const bool same = rec.lastSeen != 0 && !rec.actor && rec.formID == formID && rec.scale == scale && rec.pos[0] == pos[0] &&
 		rec.pos[1] == pos[1] && rec.pos[2] == pos[2];
 	if (!same) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
@@ -379,15 +647,16 @@ static __declspec(noinline) bool Collect(void* node) {
 		rec.formID = formID; rec.scale = scale;
 		rec.pos[0] = pos[0]; rec.pos[1] = pos[1]; rec.pos[2] = pos[2];
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.pixels = 0;
+		rec.actor = false;
 		RebuildShape(node, bound, rec);
+	} else if (rec.boxGen != gBoxGen || rec.boxPartial) {
+		RebuildShape(node, bound, rec);   // another box mode, or measured in full now: both boxes hold the object, answers stay
 	}
 	rec.lastSeen = gFrame;
 
-	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) {
-		gStats.nearSkip += 1;
-		gStats.collectUs += MicrosSince(start);
-		return false;
-	}
+	const float distance = rec.oriented ? OcclusionMath::DistanceToOrientedBox(gNowPos, rec.rot, rec.org, rec.lmn, rec.lmx) :
+		OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx);
+	if (distance < gSet.nearDistance) { gStats.nearSkip += 1; return false; }
 
 	gStats.candidates += 1;
 	gStats.candGeoms += rec.geoms;
@@ -402,7 +671,6 @@ static __declspec(noinline) bool Collect(void* node) {
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
-	gStats.collectUs += MicrosSince(start);
 	return hide;
 }
 
@@ -421,8 +689,14 @@ static bool SafeCollect(void* node) {
 // Queries (after the main opaque pass)
 
 static void ReleaseAll() {
+	gModelBoxes.clear();
 	for (auto& entry : gRecords) if (entry.second.query) entry.second.query->Release();
 	gRecords.clear();
+	for (auto& entry : gLamps) {
+		if (entry.second.rec.query) entry.second.rec.query->Release();
+		entry.second.rec = Record{};
+	}
+	gLampCandidates.clear();
 	for (IDirect3DQuery9* q : gFreeQueries) q->Release();
 	gFreeQueries.clear();
 	gCandidates.clear();
@@ -517,16 +791,20 @@ static __declspec(noinline) void RunQueries(void* camera) {
 	}
 	if (!gQueriesSupported) return;
 
-	// 1. Answers of earlier frames.
-	for (auto& entry : gRecords) {
-		Record& rec = entry.second;
-		if (!rec.pending) continue;
+	// 1. Answers of earlier frames (objects, then lamps).
+	static std::vector<Record*> polled;
+	polled.clear();
+	for (auto& entry : gRecords) if (entry.second.pending) polled.push_back(&entry.second);
+	for (auto& entry : gLamps) if (entry.second.rec.pending) polled.push_back(&entry.second.rec);
+	for (Record* pr : polled) {
+		Record& rec = *pr;
 		DWORD pixels = 0;
 		const HRESULT hr = rec.query->GetData(&pixels, sizeof(pixels), 0);
 		if (hr == S_OK) {
 			rec.pending = false;
 			rec.answered = true;
 			rec.answerFrame = rec.issued;
+			for (int i = 0; i < 3; ++i) { rec.amn[i] = rec.tmn[i]; rec.amx[i] = rec.tmx[i]; }
 			rec.pixels = pixels;
 			rec.zeroStreak = pixels ? 0 : (uint8_t)min(rec.zeroStreak + 1, 255);
 			gStats.answered += 1;
@@ -557,11 +835,10 @@ static __declspec(noinline) void RunQueries(void* camera) {
 	if (canIssue && (FAILED(device->GetDepthStencilSurface(&depth)) || !depth)) { canIssue = false; gStats.noDepth += 1; }
 	if (depth) depth->Release();
 
-	const bool noDraw = gDiag == 3;
 	if (canIssue && !gCandidates.empty()) {
 		gDepthGrows = OcclusionMath::DepthGrowsWithDistance(&proj._11);
 		// Boxes are only tested when they can be drawn: an undrawn query would answer 0 pixels and hide its object.
-		if (!noDraw && !gStates.Enter(device, gDepthGrows)) { gStats.alphaTestFrames += 1; canIssue = false; }
+		if (!gStates.Enter(device, gDepthGrows)) { gStats.alphaTestFrames += 1; canIssue = false; }
 	}
 	if (canIssue && !gCandidates.empty()) {
 		// Who is tested this frame, in what order (Scheduler.h).
@@ -579,23 +856,42 @@ static __declspec(noinline) void RunQueries(void* camera) {
 
 		D3DVIEWPORT9 vp = {};
 		device->GetViewport(&vp);
-		OcclusionMath::Vertex box[36];
 		OcclusionMath::ScreenVertex screen[36];
 		int issued = 0;
+
+		// Lamps first: few, and each one decides a whole lamp's passes.
+		for (Lamp* lamp : gLampCandidates) {
+			Record& rec = lamp->rec;
+			if (rec.pending || lamp->nearCamera) continue;
+			// A lamp whose reach was seen is tested again only every iVisibleRetestFrames frames (it can only stay lit
+			// a little longer); hidden and new ones every frame, so a hidden lamp comes back on at once.
+			if (Scheduler::Classify(rec.answered, rec.zeroStreak, gFrame - rec.issued, (uint32_t)gSet.visibleRetest) ==
+				Scheduler::kNotDue) { gStats.lampsWaiting += 1; continue; }
+			if (!OcclusionMath::ProjectBox(rec.mn, rec.mx, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
+				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, screen)) continue;
+			if (!rec.query) rec.query = AcquireQuery(device);
+			if (!rec.query) break;
+			rec.query->Issue(D3DISSUE_BEGIN);
+			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
+			rec.query->Issue(D3DISSUE_END);
+			rec.pending = true;
+			rec.issued = gFrame;
+			gStats.lampsTested += 1;
+		}
 		for (const Scheduler::Item& item : order) {
 			if (issued >= gSet.maxQueries) { gStats.budgetSkips += 1; continue; }
 			Record& rec = *gCandidates[item.index].rec;
-			OcclusionMath::BoxTriangles(rec.mn, rec.mx, posAdjust, 0xFFFFFFFF, box);
-			const bool drawable = noDraw || OcclusionMath::ProjectToScreen(box, 36, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
-				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, screen);
+			const bool drawable = OcclusionMath::ProjectCorners(rec.corner, posAdjust, &view._11, &proj._11, (float)vp.X,
+				(float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, screen);
 			if (!drawable) { rec.issued = gFrame; gStats.behindCamera += 1; continue; }   // reaches behind the camera: drawn
 			if (!rec.query) rec.query = AcquireQuery(device);
 			if (!rec.query) break;
 			rec.query->Issue(D3DISSUE_BEGIN);
-			if (!noDraw) device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
+			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, screen, sizeof(OcclusionMath::ScreenVertex));
 			rec.query->Issue(D3DISSUE_END);
 			rec.pending = true;
 			rec.issued = gFrame;
+			for (int i = 0; i < 3; ++i) { rec.tmn[i] = rec.mn[i]; rec.tmx[i] = rec.mx[i]; }
 			++issued;
 			if (item.cls == Scheduler::kCovered) gStats.issuedCovered += 1;
 			else if (item.cls == Scheduler::kNew) gStats.issuedNew += 1;
@@ -603,15 +899,14 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		}
 		gStats.issued += issued;
 
-		if (gSet.debugBoxes && !noDraw) {
+		if (gSet.debugBoxes) {
 			gStates.Set(0, 0xF);   // colour into the first target only
 			for (const Candidate& c : gCandidates) {
 				const Record& rec = *c.rec;
 				if (!rec.answered) continue;
 				gStates.Set(4, c.wouldHide ? D3DZB_FALSE : D3DZB_TRUE);
-				OcclusionMath::BoxTriangles(rec.mn, rec.mx, posAdjust, c.wouldHide ? 0xFFFF2020 : 0xFF20FF20, box);
-				if (OcclusionMath::ProjectToScreen(box, 36, &view._11, &proj._11, (float)vp.X, (float)vp.Y, (float)vp.Width,
-					(float)vp.Height, vp.MinZ, vp.MaxZ, screen))
+				if (OcclusionMath::ProjectCorners(rec.corner, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
+					(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, c.wouldHide ? 0xFFFF2020 : 0xFF20FF20, screen))
 					device->DrawPrimitiveUP(D3DPT_LINELIST, 18, screen, sizeof(OcclusionMath::ScreenVertex));
 			}
 		}
@@ -627,6 +922,17 @@ static __declspec(noinline) void RunQueries(void* camera) {
 					else gFreeQueries.push_back(it->second.query);
 				}
 				it = gRecords.erase(it);
+			} else ++it;
+		}
+	}
+	if (gFrame % 64 == 32) {
+		for (auto it = gLamps.begin(); it != gLamps.end();) {
+			if (gFrame - it->second.seenFrame > 600 && !it->second.overrideActive) {
+				if (it->second.rec.query) {
+					if (it->second.rec.pending) it->second.rec.query->Release();
+					else gFreeQueries.push_back(it->second.rec.query);
+				}
+				it = gLamps.erase(it);
 			} else ++it;
 		}
 	}
@@ -659,7 +965,8 @@ static void LogBlock() {
 	char name[64] = "";
 	if (cellName && !IsBadStringPtrA(cellName, 63)) strncpy_s(name, cellName, _TRUNCATE);
 	const double cand = gStats.candidates / f;
-	Log("--- %.0f frames, player at (%.0f, %.0f, %.0f) in cell %08X \"%s\"", gStats.frames, px, py, pz, cellID, name);
+	Log("--- %.0f frames, player at (%.0f, %.0f, %.0f) in cell %08X \"%s\" | actors %s, oriented boxes %s", gStats.frames, px, py,
+		pz, cellID, name, gActorsOn ? "on" : "off", gOrientedOn ? "on" : "off");
 	Log("  objects drawn by the main view (per frame): %.0f; not candidates: %.1f no reference, %.1f actors, %.1f doors/lights/"
 		"activators/effects, %.1f distant LOD, %.1f small, %.1f hidden by the game, %.1f near the camera", gStats.topFade / f,
 		gStats.noRef / f, gStats.actors / f, gStats.kinds / f, gStats.lod / f, gStats.smallObj / f, gStats.culledFlag / f,
@@ -670,26 +977,143 @@ static void LogBlock() {
 		"with it off (%.0f frames)", gCullingOn ? "ON" : "OFF", gStats.hidden / f, gStats.hiddenGeoms / f,
 		gStats.onFrames > 0 ? gStats.onMs / gStats.onFrames : 0.0, gStats.onFrames,
 		gStats.offFrames > 0 ? gStats.offMs / gStats.offFrames : 0.0, gStats.offFrames);
+	Log("  actors (actor culling %s): %.1f per frame drawn by the main view, %.1f near the camera, %.1f tested (%.0f shapes) | "
+		"covered %.1f: hidden %.1f (%.0f shapes), moved out of the tested box %.2f, camera guard %.1f, answer too old %.2f",
+		gActorsOn ? "on" : "off", gStats.actorSeen / f, gStats.actorNear / f, gStats.actorCands / f, gStats.actorGeoms / f,
+		gStats.actorCovered / f, gStats.actorHidden / f, gStats.actorHiddenGeoms / f, gStats.actorMoved / f, gStats.actorGuard / f,
+		gStats.actorOld / f);
+	Log("  lamps lit in the main view: %.1f per frame (lighting %.0f shapes); tested %.1f (%.1f visible ones waiting their turn), "
+		"near the camera %.1f; reach fully hidden %.1f = %.0f lit shapes (%.1f%%) | switched off %s: %.2f per frame newly, shapes "
+		"re-marked %.2f", gStats.lampsOn / f, gStats.lampShapes / f, gStats.lampsTested / f, gStats.lampsWaiting / f,
+		gStats.lampsNear / f, gStats.lampsCovered / f, gStats.lampShapesCovered / f,
+		gStats.lampShapes > 0 ? 100.0 * gStats.lampShapesCovered / gStats.lampShapes : 0.0, gSet.lampCulling ? "on" : "off (measuring)",
+		gStats.lampsOff / f, gStats.lampFlags / f);
 	Log("  candidates: %.1f per frame (%.0f shapes); covered %.1f (%.1f%%) = %.0f shapes (%.1f%% of candidate shapes)",
 		cand, gStats.candGeoms / f, gStats.wouldHide / f, cand > 0 ? 100.0 * gStats.wouldHide / gStats.candidates : 0.0,
 		gStats.hideGeoms / f, gStats.candGeoms > 0 ? 100.0 * gStats.hideGeoms / gStats.candGeoms : 0.0);
 	Log("  covered but not used: %.1f camera guard, %.1f answer too old; %.1f with no answer yet", gStats.guardBlocked / f,
 		gStats.tooOld / f, gStats.noAnswer / f);
+	Log("  boxes built in this block: %.0f (%.0f measured again with the vertex budget spent); %.0f oriented, %.0f tighter along "
+		"the world axes, %.0f animated (old box kept); shapes measured from their vertices %.0f, from bound spheres %.0f (vertices "
+		"freed after upload, skinned, particles), odd data %.0f | average box volume %.0f%% of the old boxes",
+		gStats.boxesBuilt, gStats.boxesPartial, gStats.boxesOriented, gStats.boxesAxisTighter, gStats.boxesAnimated,
+		gStats.vertexShapes, gStats.sphereShapes, gStats.oddShapes,
+		gStats.boxesBuilt > 0 ? 100.0 * gStats.volumeRatio / gStats.boxesBuilt : 100.0);
 	Log("  queries per frame: %.1f issued (%.1f covered, %.1f new, %.1f visible; %.1f visible waiting their turn), %.1f answered "
 		"(%.1f zero pixels), average age %.2f frames, %.1f not ready, %.2f failed, %.1f over budget | records %.0f",
 		gStats.issued / f, gStats.issuedCovered / f, gStats.issuedNew / f, gStats.issuedVisible / f, gStats.notDue / f,
 		gStats.answered / f, gStats.zeroAnswers / f,
 		gStats.answered > 0 ? gStats.ageSum / gStats.answered : 0.0, gStats.notReady / f, gStats.failed / f, gStats.budgetSkips / f,
 		gStats.records / f);
-	Log("  cost per frame: %.0f us collecting, %.0f us queries (CPU) | frames skipped: %.0f camera mismatch, %.0f no depth "
-		"buffer, %.0f alpha testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
-		gStats.collectUs / f, gStats.queryUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
+	Log("  cost per frame: %.0f us query pass (CPU) | frames skipped: %.0f camera mismatch, %.0f no depth buffer, %.0f alpha "
+		"testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
+		gStats.queryUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
 		gStats.behindCamera / f, gStats.identityResets);
 	gStats = Stats{};
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 // Hooks
+
+// Marks every shape the lamp lights to rebuild its lamp list (as TestFrustumCull does when a lamp turns on or off).
+static void MarkLampShapes(void* light) {
+	struct Item { Item* next; Item* prev; void* element; };
+	const Item* item = Game::At<const Item*>(light, Game::SSL_Geometries);
+	for (int n = 0; item && n < 100000; ++n, item = item->next) {
+		void* geo = item->element;
+		void* shade = geo ? Game::At<void*>(geo, Game::Geo_ShadeProperty) : nullptr;
+		if (!shade) continue;
+		const int type = Game::At<int>(shade, Game::Shade_Type);
+		if (type >= 1 && type <= 12) Game::At<bool>(shade, Game::Shade_LightListChanged) = true;
+	}
+	gStats.lampFlags += 1;
+}
+
+static __declspec(noinline) void LampNote(void* light, void* culler) {
+	if (!Game::At<bool>(light, Game::SSL_PointLight)) return;
+	void* niLight = Game::At<void*>(light, Game::SSL_Light);
+	if (!niLight) return;
+	const float radius = Game::At<float>(niLight, Game::Light_SpecR);
+	if (!(radius > 0.0f) || radius > 100000.0f) return;
+	void* camera = Game::At<void*>(culler, Game::Culler_Camera);
+	if (!camera) return;
+	const float* camPos = &Game::At<float>(camera, Game::Ni_WorldTranslate);
+	const float* camRot = &Game::At<float>(camera, Game::Ni_WorldRotate);
+	uint16_t& cull = Game::At<uint16_t>(light, Game::SSL_FrustumCull);
+
+	static uint32_t listFrame = 0;
+	if (listFrame != gFrame) { gLampCandidates.clear(); listFrame = gFrame; }   // a new frame's list, even if the last query pass did not run
+	Lamp& lamp = gLamps[light];
+	if (lamp.seenFrame != gFrame) {   // first main-view test this frame: refresh the box, decide once
+		const float* c = &Game::At<float>(niLight, Game::Ni_WorldTranslate);
+		const float reach = radius * 1.05f + 32.0f;
+		float mn[3], mx[3];
+		for (int i = 0; i < 3; ++i) { mn[i] = c[i] - reach; mx[i] = c[i] + reach; }
+		Record& rec = lamp.rec;
+		bool moved = lamp.light != niLight;
+		for (int i = 0; i < 3 && !moved; ++i) moved = std::fabs(rec.mn[i] - mn[i]) > 8.0f || std::fabs(rec.mx[i] - mx[i]) > 8.0f;
+		if (moved) {   // another lamp at a reused address, or it moved: old answers are not about this reach
+			if (rec.pending && rec.query) { rec.query->Release(); rec.query = nullptr; }
+			rec.pending = false; rec.answered = false; rec.zeroStreak = 0;
+			lamp.light = niLight;
+		}
+		for (int i = 0; i < 3; ++i) { rec.mn[i] = mn[i]; rec.mx[i] = mx[i]; }
+		lamp.seenFrame = gFrame;
+		lamp.candidate = cull != 255;   // lit in the main view by the game (and NVR)
+		lamp.nearCamera = OcclusionMath::DistanceToBox(camPos, mn, mx) < gSet.nearDistance;
+		lamp.decision = false;
+		if (lamp.candidate) {
+			const double shapes = (double)Game::At<uint32_t>(light, Game::SSL_Geometries + 8);
+			gStats.lampsOn += 1;
+			gStats.lampShapes += shapes;
+			gLampCandidates.push_back(&lamp);
+			if (lamp.nearCamera) gStats.lampsNear += 1;
+			else if (rec.answered && rec.zeroStreak >= 3) {
+				bool tooOld;
+				if (AnswerUsableAt(rec, tooOld, camPos, camRot)) {
+					lamp.decision = true;
+					gStats.lampsCovered += 1;
+					gStats.lampShapesCovered += shapes;
+				}
+			}
+		}
+	}
+
+	const bool apply = gSet.lampCulling && gCullingOn && lamp.decision && cull != 255;
+	if (apply) {
+		lamp.savedCull = cull;
+		cull = 255;
+		lamp.overrideActive = true;
+		if (!lamp.hiddenApplied) gStats.lampsOff += 1;
+	}
+	if (apply != lamp.hiddenApplied) {
+		MarkLampShapes(light);
+		lamp.hiddenApplied = apply;
+	}
+}
+
+static void SafeLampNote(void* light, void* culler) {
+	__try { LampNote(light, culler); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("the lamp test"); }
+}
+
+typedef void(__thiscall* LampTest_t)(void*, void*);
+static LampTest_t OrigLampTest = nullptr;
+
+static void __fastcall LampTestHook(void* light, void*, void* culler) {
+	// Put back what the game and NVR left before we switched the lamp off, so their own bookkeeping sees its value.
+	const bool mainThread = GetCurrentThreadId() == gMainThread;
+	if (mainThread && !gLamps.empty()) {
+		auto it = gLamps.find(light);
+		if (it != gLamps.end() && it->second.overrideActive) {
+			Game::At<uint16_t>(light, Game::SSL_FrustumCull) = it->second.savedCull;
+			it->second.overrideActive = false;
+		}
+	}
+	OrigLampTest(light, culler);
+	if (mainThread && gSet.enabled && !gFaulted && culler && culler == gMainCuller)
+		SafeLampNote(light, culler);
+}
 
 typedef void(__cdecl* Accumulate_t)(void*, void*, void*);
 static Accumulate_t OrigAccumulate = nullptr;
@@ -708,6 +1132,7 @@ static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 		for (int i = 0; i < 9; ++i) gNowRot[i] = r[i];
 		gMainCuller = culler;
 		gMainCamera = camera;
+		gVertexBudget = kVertexBudget;
 		gFadeDepth = 0;
 		gInMain = true;
 	}
@@ -717,7 +1142,7 @@ static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 
 static void __fastcall FadeOnVisibleHook(void* node, void*, void* culler) {
 	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread) {
-		if (gFadeDepth == 0 && SafeCollect(node) && gCullingOn && !gFaulted && gDiag == 0) return;   // proven covered: not drawn
+		if (gFadeDepth == 0 && SafeCollect(node) && gCullingOn && !gFaulted) return;   // proven covered: not drawn
 		++gFadeDepth;
 		OrigFadeOnVisible(node, culler);
 		--gFadeDepth;
@@ -757,17 +1182,21 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		gToggleMessage = true;
 		Log("[frame %u] hiding switched %s with the key", gFrame, gCullingOn ? "ON" : "OFF");
 	}
-	if (gSet.diagnosticKey && controls && !Game::IsInMenuMode() &&
-		Game::GetKeyboardButton(controls, gSet.diagnosticKey, Game::KeyPressed)) {
-		static const int kNext[4] = { 1, 3, 0, 0 };   // 0 -> 1 -> 3 -> 0
-		gDiag = kNext[gDiag];
-		ReleaseAll();   // answers from another mode must not decide anything
-		gDiagMessage = true;
-		Log("[frame %u] %s", gFrame, kDiagNames[gDiag]);
+	if (gSet.compareKey && controls && !Game::IsInMenuMode() &&
+		Game::GetKeyboardButton(controls, gSet.compareKey, Game::KeyPressed)) {
+		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
+		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> as set.
+		gCompareMode = (gCompareMode + 1) % 3;
+		gActorsOn = gSet.actorCulling != (gCompareMode == 1);
+		const bool oriented = gSet.orientedBoxes != (gCompareMode == 2);
+		if (oriented != gOrientedOn) { gOrientedOn = oriented; ++gBoxGen; }
+		gCompareMessage = true;
+		Log("[frame %u] compare key: actors %s, oriented boxes %s", gFrame, gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF");
 	}
-	if (gDiag != 1) SafeRunQueries(camera);
+	SafeRunQueries(camera);
 	gStats.queryUs += MicrosSince(start);
 	gCandidates.clear();
+	gLampCandidates.clear();
 	gMainCamera = nullptr;   // one query pass per main accumulate
 
 	const int slot = gFrame % kRing;
@@ -776,9 +1205,13 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	++gFrame;
 	gStats.frames += 1;
 	if (gStats.frames >= gSet.logInterval) LogBlock();
-	if (gDiagMessage) {
-		gDiagMessage = false;
-		Game::ShowMessage(kDiagNames[gDiag], 0, nullptr, nullptr, 2.0f, true);
+	if (gCompareMessage) {
+		gCompareMessage = false;
+		static char message[160];
+		static const char* const kWhat[3] = { "as set in the INI", "actors switched", "oriented boxes switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, oriented boxes %s", kWhat[gCompareMode],
+			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF");
+		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
 		gToggleMessage = false;
@@ -804,11 +1237,15 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 		return;
 	}
 	OrigFadeOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_FadeOnVisible, &FadeOnVisibleHook);
+	OrigLampTest = (LampTest_t)ReplaceCall(Game::Call_LampTest, &LampTestHook);
+	Log(OrigLampTest ? "Lamp test hook installed -> 0x%08X%s" : "0x%08X: the lamp test call is not a call; lamps are left alone%s",
+		OrigLampTest ? (unsigned)(uintptr_t)OrigLampTest : (unsigned)Game::Call_LampTest,
+		OrigLampTest && (uintptr_t)OrigLampTest != 0x00B9E970 ? " (through another plugin's hook, e.g. NVR's KeepLampsInView)" : "");
 	Log("Hooks installed: main accumulate -> 0x%08X, main opaque pass -> 0x%08X, BSFadeNode::OnVisible -> 0x%08X",
 		(unsigned)(uintptr_t)OrigAccumulate, (unsigned)(uintptr_t)OrigOpaque, (unsigned)(uintptr_t)OrigFadeOnVisible);
 	gCullingOn = gSet.culling;
-	gDiag = gSet.diagnosticStart;
-	if (gDiag) Log("Starting in %s", kDiagNames[gDiag]);
+	gOrientedOn = gSet.orientedBoxes;
+	gActorsOn = gSet.actorCulling;
 	Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 		gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
 }
@@ -823,7 +1260,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.3.0 (boxes drawn with minimal state changes, no state blocks)");
+	Log("Occlusion Culling 0.7.0 (objects, actors and hidden lamps; oriented boxes)");
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);
