@@ -322,6 +322,11 @@ constexpr int kVertexBudget = 150000;
 constexpr int kRing = 16;
 static float gCamPos[kRing][3], gCamRot[kRing][9];
 static float gNowPos[3], gNowRot[9];
+static bool gGuardOk[kRing];        // per answer age: has the main camera stayed within the guard since? (once per frame)
+
+// Queries waiting for their answers, in the order they were issued (objects and lamps). Records stay put while listed:
+// unordered_map nodes never move, and pending records are never erased.
+static std::vector<Record*> gPending;
 
 // ---------------------------------------------------------------------------------------------------------------
 // Statistics (sums over the log block)
@@ -337,7 +342,7 @@ struct Stats {
 	double lampsOn = 0, lampsTested = 0, lampsNear = 0, lampsCovered = 0, lampShapes = 0, lampShapesCovered = 0;
 	double lampsOff = 0, lampFlags = 0, lampsWaiting = 0;
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
-	double queryUs = 0;
+	double queryUs = 0, pollUs = 0, planUs = 0, lampIssueUs = 0, objectIssueUs = 0, pollsSkipped = 0, sorted = 0;
 	double records = 0;
 	double boxesBuilt = 0, boxesOriented = 0, boxesAxisTighter = 0, boxesAnimated = 0, boxesPartial = 0, volumeRatio = 0;
 	double vertexShapes = 0, sphereShapes = 0, oddShapes = 0;
@@ -544,7 +549,26 @@ static void RebuildShape(void* node, const float* bound, Record& rec) {
 
 // May the newest answer be used now? Its age in frames, and the camera's turn and move since it was drawn.
 static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos, const float* nowRot);
-static bool AnswerUsable(const Record& rec, bool& tooOld) { return AnswerUsableAt(rec, tooOld, gNowPos, gNowRot); }
+
+// The guard for every answer age at once, for the main camera (an acos per age per frame, not per object).
+static void ComputeGuard() {
+	for (uint32_t age = 1; age < (uint32_t)kRing; ++age) {
+		const int slot = (gFrame - age) % kRing;
+		const float* p = gCamPos[slot];
+		const float dx = gNowPos[0] - p[0], dy = gNowPos[1] - p[1], dz = gNowPos[2] - p[2];
+		gGuardOk[age] = std::sqrt(dx * dx + dy * dy + dz * dz) <= gSet.guardUnits * age &&
+			OcclusionMath::RotationAngleDegrees(gNowRot, gCamRot[slot]) <= gSet.guardDegrees * age;
+	}
+}
+
+// AnswerUsableAt for the main camera, from the table.
+static bool AnswerUsable(const Record& rec, bool& tooOld) {
+	tooOld = false;
+	const uint32_t age = gFrame - rec.answerFrame;
+	if (age < 1 || age > (uint32_t)gSet.maxAnswerAge || age >= kRing) { tooOld = true; return false; }
+	return gGuardOk[age];
+}
+
 static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos, const float* nowRot) {
 	tooOld = false;
 	const uint32_t age = gFrame - rec.answerFrame;
@@ -689,6 +713,7 @@ static bool SafeCollect(void* node) {
 // Queries (after the main opaque pass)
 
 static void ReleaseAll() {
+	gPending.clear();
 	gModelBoxes.clear();
 	for (auto& entry : gRecords) if (entry.second.query) entry.second.query->Release();
 	gRecords.clear();
@@ -791,13 +816,16 @@ static __declspec(noinline) void RunQueries(void* camera) {
 	}
 	if (!gQueriesSupported) return;
 
-	// 1. Answers of earlier frames (objects, then lamps).
-	static std::vector<Record*> polled;
-	polled.clear();
-	for (auto& entry : gRecords) if (entry.second.pending) polled.push_back(&entry.second);
-	for (auto& entry : gLamps) if (entry.second.rec.pending) polled.push_back(&entry.second.rec);
-	for (Record* pr : polled) {
-		Record& rec = *pr;
+	// 1. Answers of earlier frames, oldest first. The card answers in the order the queries were issued, so after the
+	// first one that is not ready yet the rest wait for the next frame without being asked.
+	LARGE_INTEGER t0, t1;
+	QueryPerformanceCounter(&t0);
+	size_t kept = 0;
+	bool waiting = false;
+	for (size_t k = 0; k < gPending.size(); ++k) {
+		Record& rec = *gPending[k];
+		if (!rec.pending) continue;   // reset meanwhile (another object at that address, or a lamp that moved)
+		if (waiting) { gPending[kept++] = &rec; gStats.pollsSkipped += 1; continue; }
 		DWORD pixels = 0;
 		const HRESULT hr = rec.query->GetData(&pixels, sizeof(pixels), 0);
 		if (hr == S_OK) {
@@ -812,14 +840,19 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			if (!pixels) gStats.zeroAnswers += 1;
 		} else if (hr == S_FALSE) {
 			gStats.notReady += 1;
+			gPending[kept++] = &rec;
+			waiting = true;
 		} else {
 			gStats.failed += 1;
-			if (hr == D3DERR_DEVICELOST) { ReleaseAll(); return; }
+			if (hr == D3DERR_DEVICELOST) { ReleaseAll(); return; }   // clears gPending: stop here
 			rec.pending = false;
 			rec.query->Release();   // never reused: after a device reset it may be dead
 			rec.query = nullptr;
 		}
 	}
+	gPending.resize(kept);
+	QueryPerformanceCounter(&t1);
+	gStats.pollUs += (double)(t1.QuadPart - t0.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
 
 	// 2. This frame's queries, only when the renderer's camera is the main camera and a depth buffer is bound.
 	const float* posAdjust = (const float*)Game::PosAdjust;
@@ -852,7 +885,13 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			if (cls == Scheduler::kNotDue) { gStats.notDue += 1; continue; }
 			order.push_back({ (uint8_t)cls, since, i });
 		}
-		Scheduler::Order(order);
+		// The order only matters when not everyone fits the budget (Scheduler.h).
+		// Over budget, only which ones are tested matters, not their order: pick the most urgent iMaxQueriesPerFrame.
+		const size_t top = (size_t)gSet.maxQueries;
+		if (order.size() > top) { Scheduler::SelectTop(order, top); gStats.sorted += 1; }
+		LARGE_INTEGER t2, t3, t4;
+		QueryPerformanceCounter(&t2);
+		gStats.planUs += (double)(t2.QuadPart - t1.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
 
 		D3DVIEWPORT9 vp = {};
 		device->GetViewport(&vp);
@@ -876,10 +915,17 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			rec.query->Issue(D3DISSUE_END);
 			rec.pending = true;
 			rec.issued = gFrame;
+			gPending.push_back(&rec);
 			gStats.lampsTested += 1;
 		}
-		for (const Scheduler::Item& item : order) {
+		QueryPerformanceCounter(&t3);
+		gStats.lampIssueUs += (double)(t3.QuadPart - t2.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
+		for (size_t k = 0; k < order.size(); ++k) {
 			if (issued >= gSet.maxQueries) { gStats.budgetSkips += 1; continue; }
+			// Budget left after the most urgent ones (some reached behind the camera): the next ones in full order, as
+			// a full sort would have given them.
+			if (k == top) std::sort(order.begin() + k, order.end(), Scheduler::Before);
+			const Scheduler::Item& item = order[k];
 			Record& rec = *gCandidates[item.index].rec;
 			const bool drawable = OcclusionMath::ProjectCorners(rec.corner, posAdjust, &view._11, &proj._11, (float)vp.X,
 				(float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, screen);
@@ -891,6 +937,7 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			rec.query->Issue(D3DISSUE_END);
 			rec.pending = true;
 			rec.issued = gFrame;
+			gPending.push_back(&rec);
 			for (int i = 0; i < 3; ++i) { rec.tmn[i] = rec.mn[i]; rec.tmx[i] = rec.mx[i]; }
 			++issued;
 			if (item.cls == Scheduler::kCovered) gStats.issuedCovered += 1;
@@ -898,6 +945,8 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			else gStats.issuedVisible += 1;
 		}
 		gStats.issued += issued;
+		QueryPerformanceCounter(&t4);
+		gStats.objectIssueUs += (double)(t4.QuadPart - t3.QuadPart) * 1e6 / (double)gQpcFreq.QuadPart;
 
 		if (gSet.debugBoxes) {
 			gStates.Set(0, 0xF);   // colour into the first target only
@@ -916,22 +965,16 @@ static __declspec(noinline) void RunQueries(void* camera) {
 	// 3. Forget objects not drawn for a while.
 	if (gFrame % 64 == 0) {
 		for (auto it = gRecords.begin(); it != gRecords.end();) {
-			if (gFrame - it->second.lastSeen > 600) {
-				if (it->second.query) {
-					if (it->second.pending) it->second.query->Release();
-					else gFreeQueries.push_back(it->second.query);
-				}
+			if (gFrame - it->second.lastSeen > 600 && !it->second.pending) {
+				if (it->second.query) gFreeQueries.push_back(it->second.query);
 				it = gRecords.erase(it);
 			} else ++it;
 		}
 	}
 	if (gFrame % 64 == 32) {
 		for (auto it = gLamps.begin(); it != gLamps.end();) {
-			if (gFrame - it->second.seenFrame > 600 && !it->second.overrideActive) {
-				if (it->second.rec.query) {
-					if (it->second.rec.pending) it->second.rec.query->Release();
-					else gFreeQueries.push_back(it->second.rec.query);
-				}
+			if (gFrame - it->second.seenFrame > 600 && !it->second.overrideActive && !it->second.rec.pending) {
+				if (it->second.rec.query) gFreeQueries.push_back(it->second.rec.query);
 				it = gLamps.erase(it);
 			} else ++it;
 		}
@@ -1005,9 +1048,11 @@ static void LogBlock() {
 		gStats.answered / f, gStats.zeroAnswers / f,
 		gStats.answered > 0 ? gStats.ageSum / gStats.answered : 0.0, gStats.notReady / f, gStats.failed / f, gStats.budgetSkips / f,
 		gStats.records / f);
-	Log("  cost per frame: %.0f us query pass (CPU) | frames skipped: %.0f camera mismatch, %.0f no depth buffer, %.0f alpha "
-		"testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
-		gStats.queryUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
+	Log("  cost per frame: %.0f us query pass (CPU) = %.0f reading answers (%.1f left for the next frame unasked) + %.0f "
+		"planning (over budget in %.0f%% of frames) + %.0f lamp tests + %.0f object tests | frames skipped: %.0f camera mismatch, %.0f "
+		"no depth buffer, %.0f alpha testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
+		gStats.queryUs / f, gStats.pollUs / f, gStats.pollsSkipped / f, gStats.planUs / f, 100.0 * gStats.sorted / f,
+		gStats.lampIssueUs / f, gStats.objectIssueUs / f, gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
 		gStats.behindCamera / f, gStats.identityResets);
 	gStats = Stats{};
 }
@@ -1070,7 +1115,7 @@ static __declspec(noinline) void LampNote(void* light, void* culler) {
 			if (lamp.nearCamera) gStats.lampsNear += 1;
 			else if (rec.answered && rec.zeroStreak >= 3) {
 				bool tooOld;
-				if (AnswerUsableAt(rec, tooOld, camPos, camRot)) {
+				if (camera == gMainCamera ? AnswerUsable(rec, tooOld) : AnswerUsableAt(rec, tooOld, camPos, camRot)) {
 					lamp.decision = true;
 					gStats.lampsCovered += 1;
 					gStats.lampShapesCovered += shapes;
@@ -1133,6 +1178,7 @@ static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 		gMainCuller = culler;
 		gMainCamera = camera;
 		gVertexBudget = kVertexBudget;
+		ComputeGuard();
 		gFadeDepth = 0;
 		gInMain = true;
 	}
@@ -1260,7 +1306,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling 0.7.0 (objects, actors and hidden lamps; oriented boxes)");
+	Log("Occlusion Culling 0.7.2 (objects, actors and hidden lamps; oriented boxes; cheaper query pass)");
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);

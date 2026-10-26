@@ -37,12 +37,21 @@ namespace Scheduler {
 		return (uint64_t)item.sinceLastTest * (item.cls == kCovered ? 2u : 1u);
 	}
 
+	// A total order (the index breaks every tie), so a selection is unique.
+	inline bool Before(const Item& a, const Item& b) {
+		const uint64_t ua = Urgency(a), ub = Urgency(b);
+		if (ua != ub) return ua > ub;
+		if (a.cls != b.cls) return a.cls < b.cls;
+		return a.index < b.index;
+	}
+
 	inline void Order(std::vector<Item>& items) {
-		std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
-			const uint64_t ua = Urgency(a), ub = Urgency(b);
-			if (ua != ub) return ua > ub;
-			if (a.cls != b.cls) return a.cls < b.cls;
-			return a.index < b.index;
-		});
+		std::sort(items.begin(), items.end(), Before);
+	}
+
+	// The n most urgent items first, in no particular order among themselves: exactly the items the first n of Order
+	// would be, in linear time instead of a full sort. The rest follow unordered (Order them if they are needed).
+	inline void SelectTop(std::vector<Item>& items, size_t n) {
+		if (n < items.size()) std::nth_element(items.begin(), items.begin() + n, items.end(), Before);
 	}
 }

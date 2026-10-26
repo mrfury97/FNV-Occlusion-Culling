@@ -85,6 +85,26 @@ int main() {
 	printf("huge (3000 covered, budget 500): %.1f%% hidden, longest gap %.0f frames\n", huge.hiddenShare * 100, huge.maxSinceCoveredTest);
 	CHECK(huge.visibleWronglyHidden == 0, "huge: wrongly hidden");
 
+	// SelectTop picks exactly the items the first n of Order would (many equal urgencies, all classes).
+	{
+		bool same = true;
+		uint32_t seed = 12345;
+		auto rnd = [&]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+		for (int trial = 0; trial < 200 && same; ++trial) {
+			std::vector<Scheduler::Item> a;
+			const uint32_t count = 50 + rnd() % 3000;
+			for (uint32_t i = 0; i < count; ++i) a.push_back({ (uint8_t)(rnd() % 3), rnd() % 8, i });
+			std::vector<Scheduler::Item> b = a;
+			const size_t n = rnd() % (count + 10);
+			Scheduler::Order(a);
+			Scheduler::SelectTop(b, n);
+			std::vector<char> inA(count, 0), inB(count, 0);
+			for (size_t k = 0; k < n && k < count; ++k) { inA[a[k].index] = 1; inB[b[k].index] = 1; }
+			same = inA == inB;
+		}
+		CHECK(same, "SelectTop chose different items than Order");
+	}
+
 	printf(gFails ? "%d FAILED\n" : "all scheduler checks passed\n", gFails);
 	return gFails ? 1 : 0;
 }
