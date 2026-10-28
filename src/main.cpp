@@ -103,7 +103,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.1.0-dev2";
+constexpr const char* kVersion = "1.1.0-dev3";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -140,6 +140,7 @@ struct Settings {
 	bool culling = true;             // start with hiding on
 	int toggleKey = 0xD2;            // DirectInput scancode of the on/off key (Insert)
 	bool distantLOD = false;         // also test distant LOD objects
+	bool imposters = true;           // also test imposters (refs flagged to show at any distance: never faded out)
 	bool lampCulling = false;        // switch hidden lamps off (otherwise they are only measured)
 	bool orientedBoxes = true;       // tighter boxes from the shapes' vertices, in the object's own frame
 	int compareKey = 0xCF;           // switches actors, then oriented boxes, off for comparisons (End)
@@ -182,6 +183,7 @@ static void LoadSettings() {
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
 	gSet.toggleKey = readI("General", "iToggleKey", 0xD2, 0, 255);
 	gSet.distantLOD = readI("Candidates", "bDistantLOD", 0, 0, 1) != 0;
+	gSet.imposters = readI("Candidates", "bImposters", 1, 0, 1) != 0;
 	gSet.lampCulling = readI("Lamps", "bLampCulling", 0, 0, 1) != 0;
 	gSet.orientedBoxes = readI("Boxes", "bOrientedBoxes", 1, 0, 1) != 0;
 	gSet.compareKey = kDevTools ? readI("Debug", "iCompareKey", 0xCF, 0, 255) : 0;
@@ -209,9 +211,9 @@ static void LoadSettings() {
 	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
 	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
 	Log("Settings: enabled %d, hiding %s at start, on/off key 0x%02X | candidates: radius >= %.0f, box farther than %.0f, "
-		"distant LOD %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
+		"distant LOD %d, imposters %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
 		"%.0f units per frame | log every %d frames, debug boxes %d", gSet.enabled, gSet.culling ? "on" : "off", gSet.toggleKey,
-		gSet.minRadius, gSet.nearDistance, gSet.distantLOD, gSet.maxQueries, gSet.maxAnswerAge, gSet.visibleRetest, gSet.guardDegrees,
+		gSet.minRadius, gSet.nearDistance, gSet.distantLOD, gSet.imposters, gSet.maxQueries, gSet.maxAnswerAge, gSet.visibleRetest, gSet.guardDegrees,
 		gSet.guardUnits, kDevTools ? gSet.logInterval : 0, gSet.debugBoxes);
 }
 
@@ -441,6 +443,8 @@ struct Stats {
 		double noShapes = 0;
 	} actor, door;
 	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
+	double lodImposter = 0, lodMenu = 0, lodInvisible = 0;   // not candidates, by kind
+	double impSeen = 0, impCands = 0, impGeoms = 0, impHidden = 0, impHiddenGeoms = 0;
 } gStats;
 static LARGE_INTEGER gQpcFreq;
 
@@ -811,15 +815,21 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	         baseType == Game::kLIGH || baseType == Game::kACTI || baseType == Game::kTACT || baseType == Game::kTERM ||
 	         baseType == Game::kPWAT)
 		gStats.kinds += 1;
-	else if ((mult == Game::kLodDistant && !gSet.distantLOD) || mult == Game::kLodMenu || mult == Game::kLodInvisible ||
-	         mult == Game::kLodImposter)
+	else if (mult == Game::kLodDistant && !gSet.distantLOD)
 		gStats.lod += 1;
+	else if (mult == Game::kLodImposter && !gSet.imposters)
+		gStats.lodImposter += 1;
+	else if (mult == Game::kLodMenu)
+		gStats.lodMenu += 1;
+	else if (mult == Game::kLodInvisible)
+		gStats.lodInvisible += 1;
 	else if (!bound || !(bound[3] >= gSet.minRadius))
 		gStats.smallObj += 1;
 	else if (Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)
 		gStats.culledFlag += 1;
 	else
 		skip = false;
+	if (mult == Game::kLodImposter) gStats.impSeen += 1;
 	if (skip) return false;
 
 	Record& rec = gRecords[node];
@@ -860,6 +870,11 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
+	if (mult == Game::kLodImposter) {
+		gStats.impCands += 1;
+		gStats.impGeoms += rec.geoms;
+		if (hide && gCullingOn) { gStats.impHidden += 1; gStats.impHiddenGeoms += rec.geoms; }
+	}
 	if (tree) {
 		gStats.treeCands += 1;
 		gStats.treeGeoms += rec.geoms;
@@ -1249,9 +1264,13 @@ static void LogBlock() {
 		"activators %s", gStats.frames, px, py, pz, cellID, name, gActorsOn ? "on" : "off", gOrientedOn ? "on" : "off",
 		gTreesOn ? "on" : "off", gActivatorsOn ? "on" : "off");
 	Log("  objects drawn by the main view (per frame): %.0f; not candidates: %.1f no reference, %.1f actors, %.1f doors/lights/"
-		"activators/effects (when not tested themselves), %.1f distant LOD, %.1f small, %.1f hidden by the game, %.1f near the camera", gStats.topFade / f,
-		gStats.noRef / f, gStats.actors / f, gStats.kinds / f, gStats.lod / f, gStats.smallObj / f, gStats.culledFlag / f,
-		gStats.nearSkip / f);
+		"activators/effects (when not tested themselves), %.1f distant LOD, %.1f imposters (bImposters=0), %.1f terminal screens, "
+		"%.1f disabled/invisible, %.1f small, %.1f hidden by the game, %.1f near the camera", gStats.topFade / f,
+		gStats.noRef / f, gStats.actors / f, gStats.kinds / f, gStats.lod / f, gStats.lodImposter / f, gStats.lodMenu / f,
+		gStats.lodInvisible / f, gStats.smallObj / f, gStats.culledFlag / f, gStats.nearSkip / f);
+	Log("  imposters (shown at any distance, %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
+		"(%.0f shapes); counted with the objects above and below", gSet.imposters ? "tested" : "not tested", gStats.impSeen / f,
+		gStats.impCands / f, gStats.impGeoms / f, gStats.impHidden / f, gStats.impHiddenGeoms / f);
 	if (gStats.topFade == 0)
 		Log("  Warning: no object reached the BSFadeNode hook in this block (another plugin replaced that vtable slot later?)");
 	Log("  hiding %s: %.1f objects = %.0f shapes not drawn per frame | frame time: %.2f ms with hiding on (%.0f frames), %.2f ms "

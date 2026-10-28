@@ -58,6 +58,7 @@ Defaults below are the developer INI's; the release INI's differences are listed
 | `fMinRadius` | 150 | Smaller objects are never tested (75 also covers more clutter) |
 | `fNearDistance` | 400 | Objects closer than this are never tested |
 | `bDistantLOD` | 0 | Also test distant LOD objects |
+| `bImposters` | 1 | Imposters are tested too: references the game shows at any distance and never fades out (mostly big buildings, cliffs and landmarks in loaded cells). 18-82 reach the view per frame outdoors, 30-80% of them hidden |
 | `iMaxQueriesPerFrame` | 500 | Test budget per frame (1000 helps very dense areas) |
 | `iMaxAnswerAge` | 4 | Oldest answer, in frames, that may hide an object |
 | `iVisibleRetestFrames` | 4 | How often visible objects are retested |
