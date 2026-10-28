@@ -103,7 +103,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.0.0";
+constexpr const char* kVersion = "1.1.0-dev2";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -145,6 +145,9 @@ struct Settings {
 	int compareKey = 0xCF;           // switches actors, then oriented boxes, off for comparisons (End)
 	bool actorCulling = true;        // NPCs and creatures are tested and hidden too
 	float actorMargin = 24.0f;       // added around an actor's bound (plus 10% of its radius)
+	bool animThrottle = true;        // actors the main view does not draw update their bones every animInterval frames
+	int animInterval = 2;
+	float animNearDistance = 512.0f; // actors closer than this to the camera always update every frame
 	bool activatorCulling = true;    // doors, activators, talking activators and terminals are tested and hidden too
 	float activatorMargin = 16.0f;   // added around their bound (plus 5% of its radius)
 	bool treeCulling = true;         // SpeedTree trees and shrubs are tested and hidden too
@@ -184,6 +187,9 @@ static void LoadSettings() {
 	gSet.compareKey = kDevTools ? readI("Debug", "iCompareKey", 0xCF, 0, 255) : 0;
 	gSet.actorCulling = readI("Actors", "bActorCulling", 1, 0, 1) != 0;
 	gSet.actorMargin = readF("Actors", "fActorMargin", 24.0f, 0.0f, 512.0f);
+	gSet.animThrottle = readI("Actors", "bAnimThrottle", 1, 0, 1) != 0;
+	gSet.animInterval = readI("Actors", "iAnimInterval", 2, 1, 8);
+	gSet.animNearDistance = readF("Actors", "fAnimNearDistance", 512.0f, 0.0f, 100000.0f);
 	gSet.activatorCulling = readI("Activators", "bActivatorCulling", 1, 0, 1) != 0;
 	gSet.activatorMargin = readF("Activators", "fActivatorMargin", 16.0f, 0.0f, 512.0f);
 	Log("Doors, activators, terminals: %s, margin 5%% + %.0f units",
@@ -194,6 +200,11 @@ static void LoadSettings() {
 		gSet.treeMargin);
 	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
 		gSet.actorMargin);
+	if (gSet.animThrottle && gSet.animInterval > 1)
+		Log("Actor bones: actors behind cover or outside the view, %.0f+ units away, update every %d frames", gSet.animNearDistance,
+			gSet.animInterval);
+	else
+		Log("Actor bones: every frame for all actors (bAnimThrottle=0 or iAnimInterval=1)");
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
 	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
 	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
@@ -256,6 +267,19 @@ namespace Game {
 	constexpr uintptr_t Call_MainOpaque = 0x00874180;       // TESMain::DrawScene -> RenderScenePreResolveDepth 0xB6BA20
 	constexpr uintptr_t Vtbl_FadeOnVisible = 0x010A9064;    // BSFadeNode vtable slot 53 -> BSFadeNode::OnVisible 0xB4E490
 	constexpr uintptr_t Vtbl_TreeOnVisible = 0x010669B8;    // BSTreeNode vtable slot 53 -> BSTreeNode::OnVisible 0x66BF50
+	// Actor animation steps (measured in developer builds). The three steps run on the AI threads and in parallel tasks.
+	constexpr uintptr_t Fn_ActorUpdateAnimation = 0x00888070;     // Actor::UpdateAnimation (AI thread: sequences, pose, tracking)
+	constexpr uintptr_t Fn_ActorUpdateAnimMovement = 0x008885A0;  // Actor::UpdateAnimMovement (parallel task: non-bip controllers, movement)
+	constexpr uintptr_t Fn_QueuedScenegraph = 0x00493930;         // Animation::UpdateQueuedScenegraph (after the AI join: bone transforms)
+	constexpr uintptr_t Vtbl_ActorUpdateAnimation[] = { 0x010844BC, 0x01086CD4, 0x01087314, 0x0108ACA4 };
+	constexpr uintptr_t Vtbl_ActorUpdateAnimMovement[] = { 0x010845A4, 0x01086DBC, 0x010873FC, 0x0108AD8C };
+	constexpr uintptr_t Call_QueuedScenegraph[] = {
+		0x0096C8ED,   // ProcessLists::UpdateAnimationScenegraph (one thread)
+		0x0096CA73,   // ProcessLists::ParallelUpdateAnimationScenegraph (tasklets off)
+		0x0096CB40,   // UpdateAnimSceneGraph (its tasklet function)
+	};
+	constexpr uintptr_t Anim_Actor = 0x04;                        // Animation::pActor
+	constexpr uintptr_t Fn_SetDelayUpdateScenegraph = 0x004939B0;   // Animation::SetDelayUpdateScenegraph(bool)
 	constexpr uintptr_t Call_LampTest = 0x00B5E915;         // ShadowSceneNode::PreOnVisible -> ShadowSceneLight::TestFrustumCull 0xB9E970
 
 	// ShadowSceneLight / NiLight / shapes (IDA local types)
@@ -375,6 +399,7 @@ static bool gActorsOn = true;       // bActorCulling, then the compare key
 static bool gTreesOn = true;        // bTreeCulling, then the compare key
 static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
 static bool gRevealOn = true;       // fRevealDepth > 0, then the compare key
+static bool gAnimThrottleOn = true; // bAnimThrottle, then the compare key
 constexpr float kRevealMinMove = 0.5f;   // camera moves below this (units per frame) grow nothing
 // 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped, 3 trees flipped, 4 doors/activators flipped
 static int gCompareMode = 0;
@@ -418,6 +443,48 @@ struct Stats {
 	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
 } gStats;
 static LARGE_INTEGER gQpcFreq;
+
+// Actors the main view does not draw: per actor ref, the newest main-view frame that reached it and the newest one that
+// hid it. The animation steps (AI threads, parallel tasks) read it, so it sits behind a lock. Developer builds also time
+// the engine's three per-actor steps, split into drawn / hidden by us / outside the main view.
+namespace AnimCost {
+	enum Step { kUpdate, kPose, kBones, kSteps };
+	enum Class { kDrawn, kHidden, kOutside, kClasses };
+	struct Sum { volatile LONG64 ticks[kClasses] = {}, calls[kClasses] = {}; };
+	static Sum gSum[kSteps];
+	static volatile LONG64 gSkipped[kClasses];                     // bone updates left for a later frame
+	static SRWLOCK gLock = SRWLOCK_INIT;
+	struct Seen { uint32_t seen = 0, hidden = 0; };
+	static std::unordered_map<void*, Seen> gActors;
+	static bool gHooked[kSteps];
+
+	static void Mark(void* ref, uint32_t frame, bool hidden) {
+		AcquireSRWLockExclusive(&gLock);
+		Seen& s = gActors[ref];
+		s.seen = frame;
+		if (hidden) s.hidden = frame;
+		ReleaseSRWLockExclusive(&gLock);
+	}
+	// Hidden: hidden by us in the newest main view (or the one being drawn). Outside: no main view reached it in the last
+	// two frames. Anything in between counts as drawn.
+	static Class Classify(void* ref, uint32_t now) {
+		AcquireSRWLockShared(&gLock);
+		auto it = gActors.find(ref);
+		Class c = kOutside;
+		if (it != gActors.end()) {
+			if (it->second.hidden + 1 >= now) c = kHidden;
+			else if (it->second.seen + 2 >= now) c = kDrawn;
+		}
+		ReleaseSRWLockShared(&gLock);
+		return c;
+	}
+	static void Prune(uint32_t now) {
+		AcquireSRWLockExclusive(&gLock);
+		for (auto it = gActors.begin(); it != gActors.end();)
+			it = it->second.seen + 600 < now ? gActors.erase(it) : std::next(it);
+		ReleaseSRWLockExclusive(&gLock);
+	}
+}
 static bool gDepthGrows = true, gLoggedFirst = false;
 
 static double MicrosSince(const LARGE_INTEGER& start) {
@@ -707,6 +774,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 	}
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { st.hidden += 1; st.hiddenGeoms += rec.geoms; }
+	if (isActor && hide && gCullingOn) AnimCost::Mark(ref, gFrame, true);
 	return hide;
 }
 
@@ -725,6 +793,8 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	const float* bound = Game::At<const float*>(node, Game::Ni_WorldBound);
 
 	bool skip = true;
+	const bool isActorRef = (refType == Game::kCharacter || refType == Game::kCreature) && ref != *(void**)Game::PlayerPtr;
+	if (isActorRef) AnimCost::Mark(ref, gFrame, false);   // reached by the main view (CollectMoving marks the hidden ones)
 	if (gActorsOn && (refType == Game::kCharacter || refType == Game::kCreature) && mult != Game::kLodBodyPart &&
 		ref != *(void**)Game::PlayerPtr && bound && bound[3] > 0.0f && bound[3] < 10000.0f &&
 		!(Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)) {
@@ -1196,6 +1266,28 @@ static void LogBlock() {
 	};
 	logMoving("actors", gActorsOn, gStats.actor);
 	logMoving("doors, activators, terminals", gActivatorsOn, gStats.door);
+	{
+		using namespace AnimCost;
+		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
+		auto step = [&](Step s) {
+			static char text[kSteps][200];
+			const Sum& m = gSum[s];
+			if (!gHooked[s]) { snprintf(text[s], sizeof text[s], "not hooked"); return (const char*)text[s]; }
+			snprintf(text[s], sizeof text[s], "%.0f / %.0f / %.0f us (%.1f / %.1f / %.1f actors)", m.ticks[kDrawn] * us,
+				m.ticks[kHidden] * us, m.ticks[kOutside] * us, m.calls[kDrawn] / f, m.calls[kHidden] / f, m.calls[kOutside] / f);
+			return (const char*)text[s];
+		};
+		Log("  actor animation, CPU per frame summed over all threads (not the player), drawn / hidden by us / outside the "
+			"main view: sequences + pose (AI thread) %s | movement + other controllers (parallel tasks) %s | bone transforms "
+			"(after the AI join) %s", step(kUpdate), step(kPose), step(kBones));
+		Log("  actor bones (%s, every %d frames beyond %.0f units): left for a later frame %.1f hidden + %.1f outside the view "
+			"per frame", gAnimThrottleOn && gSet.animInterval > 1 ? "throttled" : "every frame", gSet.animInterval,
+			gSet.animNearDistance, gSkipped[kHidden] / f, gSkipped[kOutside] / f);
+		for (volatile LONG64& k : gSkipped) InterlockedExchange64(&k, 0);
+		for (Sum& m : gSum)
+			for (int h = 0; h < kClasses; ++h) { InterlockedExchange64(&m.ticks[h], 0); InterlockedExchange64(&m.calls[h], 0); }
+		Prune(gFrame);
+	}
 	Log("  trees (SpeedTree, tree culling %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
 		"(%.0f shapes); counted with the objects above and below", gTreesOn ? "on" : "off", gStats.treeSeen / f, gStats.treeCands / f,
 		gStats.treeGeoms / f, gStats.treeHidden / f, gStats.treeHiddenGeoms / f);
@@ -1426,17 +1518,18 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
 		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> trees
 		// flipped -> as set.
-		gCompareMode = (gCompareMode + 1) % 6;
+		gCompareMode = (gCompareMode + 1) % 7;
 		gActorsOn = gSet.actorCulling != (gCompareMode == 1);
 		const bool oriented = gSet.orientedBoxes != (gCompareMode == 2);
 		gTreesOn = gSet.treeCulling != (gCompareMode == 3);
 		gActivatorsOn = gSet.activatorCulling != (gCompareMode == 4);
 		gRevealOn = (gSet.revealDepth > 0.0f) != (gCompareMode == 5);
+		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 6);
 		if (oriented != gOrientedOn) { gOrientedOn = oriented; ++gBoxGen; }
 		gCompareMessage = true;
-		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s, box growth %s", gFrame,
-			gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF", gActivatorsOn ? "ON" : "OFF",
-			gRevealOn ? "ON" : "OFF");
+		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s, box growth %s, actor bone "
+			"throttle %s", gFrame, gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF",
+			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF", gAnimThrottleOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
 	if (kDevTools) gStats.queryUs += MicrosSince(start);
@@ -1456,11 +1549,11 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[6] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
-			"doors/activators switched", "box growth switched" };
-		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s, growth %s",
+		static const char* const kWhat[7] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
+			"doors/activators switched", "box growth switched", "bone throttle switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s, growth %s, bones %s",
 			kWhat[gCompareMode], gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF",
-			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF");
+			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF", gAnimThrottleOn ? "half rate" : "every frame");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1468,6 +1561,96 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		Game::ShowMessage(gCullingOn ? "Occlusion culling: ON" : "Occlusion culling: OFF (measuring only)", 0, nullptr, nullptr,
 			2.0f, true);
 	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Actor animation timing (developer builds)
+
+typedef void(__thiscall* ActorUpdateAnim_t)(void*, float);
+typedef void(__thiscall* ActorAnimMove_t)(void*);
+typedef char(__thiscall* QueuedScenegraph_t)(void*);
+
+typedef void(__thiscall* SetDelayUpdateScenegraph_t)(void*, bool);
+
+static void AddAnimCost(AnimCost::Step step, void* actor, const LARGE_INTEGER& a) {
+	LARGE_INTEGER b;
+	QueryPerformanceCounter(&b);
+	if (!actor || actor == *(void**)Game::PlayerPtr) return;
+	const int c = AnimCost::Classify(actor, gFrame);
+	InterlockedAdd64(&AnimCost::gSum[step].ticks[c], b.QuadPart - a.QuadPart);
+	InterlockedIncrement64(&AnimCost::gSum[step].calls[c]);
+}
+
+// Bone transforms of an actor the main view does not draw (hidden by us, or outside the view in the last two frames)
+// and that is not near the camera are brought up to date only every iAnimInterval frames. The skipped ones get the
+// engine's "update queued" flag cleared, as a done update would, so the next frame queues them again normally.
+static bool SkipBones(void* animation) {
+	if (!gAnimThrottleOn || !gCullingOn || gSet.animInterval <= 1 || gFaulted) return false;
+	void* actor = Game::At<void*>(animation, Game::Anim_Actor);
+	if (!actor || actor == *(void**)Game::PlayerPtr) return false;
+	const uint32_t now = gFrame;
+	if ((now + (uint32_t)((uintptr_t)actor >> 4)) % (uint32_t)gSet.animInterval == 0) return false;   // its turn
+	const AnimCost::Class c = AnimCost::Classify(actor, now);
+	if (c == AnimCost::kDrawn) return false;
+	const float* p = &Game::At<float>(actor, Game::Ref_Position);
+	const float dx = p[0] - gNowPos[0], dy = p[1] - gNowPos[1], dz = p[2] - gNowPos[2];
+	if (dx * dx + dy * dy + dz * dz < gSet.animNearDistance * gSet.animNearDistance) return false;
+	if (kDevTools) InterlockedIncrement64(&AnimCost::gSkipped[c]);
+	return true;
+}
+
+static void __fastcall ActorUpdateAnimationHook(void* actor, void*, float time) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	((ActorUpdateAnim_t)Game::Fn_ActorUpdateAnimation)(actor, time);
+	AddAnimCost(AnimCost::kUpdate, actor, a);
+}
+
+static void __fastcall ActorUpdateAnimMovementHook(void* actor, void*) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	((ActorAnimMove_t)Game::Fn_ActorUpdateAnimMovement)(actor);
+	AddAnimCost(AnimCost::kPose, actor, a);
+}
+
+static char __fastcall QueuedScenegraphHook(void* animation, void*) {
+	if (SkipBones(animation)) {
+		((SetDelayUpdateScenegraph_t)Game::Fn_SetDelayUpdateScenegraph)(animation, false);
+		return 0;
+	}
+	LARGE_INTEGER a = {};
+	if (kDevTools) QueryPerformanceCounter(&a);
+	const char updated = ((QueuedScenegraph_t)Game::Fn_QueuedScenegraph)(animation);
+	if (kDevTools && updated) AddAnimCost(AnimCost::kBones, Game::At<void*>(animation, Game::Anim_Actor), a);
+	return updated;
+}
+
+// Only slots and calls that still point at the game's own function are taken (another plugin's hook is left alone).
+static void InstallAnimHooks() {
+	int updates = 0, moves = 0, bones = 0;
+	if (!kDevTools && !(gSet.animThrottle && gSet.animInterval > 1)) return;
+	if (*(uint8_t*)(Game::Fn_SetDelayUpdateScenegraph) != 0x55) {   // push ebp: the function is where it should be
+		Log("Actor bones: 0x%08X is not Animation::SetDelayUpdateScenegraph; actor animation left alone",
+			(unsigned)Game::Fn_SetDelayUpdateScenegraph);
+		return;
+	}
+	for (uintptr_t slot : Game::Vtbl_ActorUpdateAnimation)
+		if (kDevTools && *(uintptr_t*)slot == Game::Fn_ActorUpdateAnimation) { ReplaceVirtual(slot, &ActorUpdateAnimationHook); ++updates; }
+	for (uintptr_t slot : Game::Vtbl_ActorUpdateAnimMovement)
+		if (kDevTools && *(uintptr_t*)slot == Game::Fn_ActorUpdateAnimMovement) {
+			ReplaceVirtual(slot, &ActorUpdateAnimMovementHook);
+			++moves;
+		}
+	for (uintptr_t at : Game::Call_QueuedScenegraph)
+		if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_QueuedScenegraph) {
+			ReplaceCall(at, &QueuedScenegraphHook);
+			++bones;
+		}
+	AnimCost::gHooked[AnimCost::kUpdate] = updates > 0;
+	AnimCost::gHooked[AnimCost::kPose] = moves > 0;
+	AnimCost::gHooked[AnimCost::kBones] = bones > 0;
+	Log("Actor animation hooks: %d of 4 UpdateAnimation slots, %d of 4 UpdateAnimMovement slots (timing, developer builds), %d "
+		"of 3 bone transform calls", updates, moves, bones);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1491,6 +1674,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	Log("Tree hook installed: BSTreeNode::OnVisible -> 0x%08X%s", (unsigned)(uintptr_t)OrigTreeOnVisible,
 		(uintptr_t)OrigTreeOnVisible != 0x0066BF50 ? " (through another plugin's hook)" : "");
 	OrigLampTest = (LampTest_t)ReplaceCall(Game::Call_LampTest, &LampTestHook);
+	InstallAnimHooks();
 	Log(OrigLampTest ? "Lamp test hook installed -> 0x%08X%s" : "0x%08X: the lamp test call is not a call; lamps are left alone%s",
 		OrigLampTest ? (unsigned)(uintptr_t)OrigLampTest : (unsigned)Game::Call_LampTest,
 		OrigLampTest && (uintptr_t)OrigLampTest != 0x00B9E970 ? " (through another plugin's hook, e.g. NVR's KeepLampsInView)" : "");
@@ -1502,6 +1686,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gTreesOn = gSet.treeCulling;
 	gActivatorsOn = gSet.activatorCulling;
 	gRevealOn = gSet.revealDepth > 0.0f;
+	gAnimThrottleOn = gSet.animThrottle;
 	if (kDevTools)
 		Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 			gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
