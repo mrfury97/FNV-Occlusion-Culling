@@ -103,7 +103,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.1.0-dev3";
+constexpr const char* kVersion = "1.1.0-dev6";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -152,6 +152,8 @@ struct Settings {
 	bool activatorCulling = true;    // doors, activators, talking activators and terminals are tested and hidden too
 	float activatorMargin = 16.0f;   // added around their bound (plus 5% of its radius)
 	bool treeCulling = true;         // SpeedTree trees and shrubs are tested and hidden too
+	bool landCulling = true;         // land quadrants (2048 x 2048 units, four per cell) are tested and hidden too
+	float landMargin = 32.0f;        // added above and below a quadrant's height range (tessellated land moves)
 	float treeMargin = 32.0f;        // added around a tree's bound (plus 20% of its radius) for its leaf cards
 } gSet;
 
@@ -198,6 +200,8 @@ static void LoadSettings() {
 		gSet.activatorCulling ? "tested and hidden like actors" : "never touched (bActivatorCulling=0)", gSet.activatorMargin);
 	gSet.treeCulling = readI("Trees", "bTreeCulling", 1, 0, 1) != 0;
 	gSet.treeMargin = readF("Trees", "fTreeMargin", 32.0f, 0.0f, 1024.0f);
+	gSet.landCulling = readI("Land", "bLandCulling", 1, 0, 1) != 0;
+	gSet.landMargin = readF("Land", "fLandMargin", 32.0f, 0.0f, 1024.0f);
 	Log("Trees: %s, margin 20%% + %.0f units", gSet.treeCulling ? "tested and hidden like objects" : "never touched (bTreeCulling=0)",
 		gSet.treeMargin);
 	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
@@ -207,6 +211,8 @@ static void LoadSettings() {
 			gSet.animInterval);
 	else
 		Log("Actor bones: every frame for all actors (bAnimThrottle=0 or iAnimInterval=1)");
+	Log("Land: %s, height margin %.0f units", gSet.landCulling ? "quadrants tested and hidden like objects" :
+		"never touched (bLandCulling=0)", gSet.landMargin);
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
 	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
 	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
@@ -282,6 +288,31 @@ namespace Game {
 	};
 	constexpr uintptr_t Anim_Actor = 0x04;                        // Animation::pActor
 	constexpr uintptr_t Fn_SetDelayUpdateScenegraph = 0x004939B0;   // Animation::SetDelayUpdateScenegraph(bool)
+	// Cell update on the AI thread (TES::UpdateCellAnimations 0x453550), measured in developer builds.
+	constexpr uintptr_t Fn_CellUpdateManagedNodes = 0x00551890;   // TESObjectCELL::UpdateManagedNodes(time, largeOnly)
+	constexpr uintptr_t Call_CellUpdateManagedNodes[] = {
+		0x00453608,   // TES::UpdateCellAnimations (interior)
+		0x004BAA98,   // GridCellArray::UpdateManagedNodes (each loaded exterior cell)
+	};
+	// The other calls in TES::UpdateCellAnimations (each checked against its target before it is taken)
+	constexpr uintptr_t Call_LockHavok = 0x004535EE;               // TES::LockHavokUpdateMT(true) 0x453860
+	constexpr uintptr_t Call_GridUpdate = 0x0045361F;              // GridCellArray::UpdateManagedNodes 0x4BA9A0
+	constexpr uintptr_t Call_ParallelTasks = 0x00453648;           // TaskQueueInterface::QueueParallelTaskProcessing 0x87AA90
+	constexpr uintptr_t Call_ObjectDamage = 0x00453654;            // FOCollisionListener::DealObjectDamage 0x623640
+	constexpr uintptr_t Call_Projectiles = 0x004536CF;             // ProcessLists::PostProcessProjectiles 0x975080
+	constexpr uintptr_t Vtbl_bhkWorldUpdate = 0x010C6AB8;          // bhkWorldM vtable slot 49 -> bhkWorld::Update
+	constexpr uintptr_t Fn_bhkWorldUpdate = 0x00C6AE70;
+	constexpr uintptr_t Vtbl_FadeUpdateSelected = 0x010A9038;      // BSFadeNode vtable slot 42 -> UpdateSelectedDownwardPass
+	constexpr uintptr_t Fn_FadeUpdateSelected = 0x00B4EA20;
+	// Land: TESObjectCELL::Load3D 0x545CF0 gives each cell's land node four BSMultiBoundNode quadrants (cull mode
+	// ALLPASS, one BSMultiBoundAABB each); TESObjectLAND::Attach3D 0x5374F0 puts the quadrant's land strips in child 0
+	// and sets the AABB to centre + (1024, 1024, height range / 2).
+	constexpr uintptr_t Vtbl_MultiBoundOnVisible = 0x010C1DE8;    // BSMultiBoundNode vtable slot 53
+	constexpr uintptr_t Fn_MultiBoundOnVisible = 0x00C46F60;      // BSMultiBoundNode::OnVisible
+	constexpr uintptr_t MBNode_MultiBound = 0xAC;                 // BSMultiBoundNode::spMultiBound
+	constexpr uintptr_t MB_Shape = 0x0C;                          // BSMultiBound::spShape
+	constexpr uintptr_t MBAABB_Center = 0x0C;                     // BSMultiBoundAABB::kCenter
+	constexpr uintptr_t MBAABB_HalfExtents = 0x18;                // BSMultiBoundAABB::kHalfExtents
 	constexpr uintptr_t Call_LampTest = 0x00B5E915;         // ShadowSceneNode::PreOnVisible -> ShadowSceneLight::TestFrustumCull 0xB9E970
 
 	// ShadowSceneLight / NiLight / shapes (IDA local types)
@@ -358,6 +389,7 @@ struct Record {
 	bool afterGrown = false;                   // a grown box showed pixels: tested next frame, one 0 restores the streak
 	uint8_t streakBeforeGrown = 0;             // the 0-pixel streak it had before that
 	bool tree = false;                         // a SpeedTree (BSTreeNode): box = bound cube + leaf margin
+	bool land = false;                         // a land quadrant (BSMultiBoundNode): box = its multibound AABB
 	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
 	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
 };
@@ -401,9 +433,10 @@ static bool gActorsOn = true;       // bActorCulling, then the compare key
 static bool gTreesOn = true;        // bTreeCulling, then the compare key
 static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
 static bool gRevealOn = true;       // fRevealDepth > 0, then the compare key
+static bool gLandOn = true;         // bLandCulling, then the compare key
 static bool gAnimThrottleOn = true; // bAnimThrottle, then the compare key
 constexpr float kRevealMinMove = 0.5f;   // camera moves below this (units per frame) grow nothing
-// 0 the INI's settings, 1 actors flipped, 2 oriented boxes flipped, 3 trees flipped, 4 doors/activators flipped
+// 0 the INI's settings, 1 land flipped, 2 actor bone throttle flipped (the features still being compared)
 static int gCompareMode = 0;
 static uint32_t gBoxGen = 1;        // changes when the box mode does: boxes are built again
 static bool gCompareMessage = false;
@@ -443,6 +476,7 @@ struct Stats {
 		double noShapes = 0;
 	} actor, door;
 	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
+	double landSeen = 0, landQuads = 0, landNear = 0, landCands = 0, landCovered = 0, landHidden = 0, landGuard = 0;
 	double lodImposter = 0, lodMenu = 0, lodInvisible = 0;   // not candidates, by kind
 	double impSeen = 0, impCands = 0, impGeoms = 0, impHidden = 0, impHiddenGeoms = 0;
 } gStats;
@@ -487,6 +521,48 @@ namespace AnimCost {
 		for (auto it = gActors.begin(); it != gActors.end();)
 			it = it->second.seen + 600 < now ? gActors.erase(it) : std::next(it);
 		ReleaseSRWLockExclusive(&gLock);
+	}
+}
+
+namespace CellCost {
+	static volatile LONG64 gPhysTicks, gPhysCalls, gPhysInCellTicks, gCellTicks, gCellCalls;
+	static volatile LONG64 gObjTicks[AnimCost::kClasses], gObjCalls[AnimCost::kClasses];
+	static SRWLOCK gLock = SRWLOCK_INIT;
+	static std::unordered_map<void*, AnimCost::Seen> gNodes;      // BSFadeNode -> main-view frames
+	static thread_local int tInCell = 0, tInObject = 0;
+	enum Part { kLock, kGrid, kTasks, kDamage, kProjectiles, kParts };
+	static volatile LONG64 gPartTicks[kParts], gPartCalls[kParts];
+	static uintptr_t gPartOrig[kParts];
+	static bool gHooked = false;
+
+	static void Mark(void* node, uint32_t frame, bool hidden) {
+		AcquireSRWLockExclusive(&gLock);
+		AnimCost::Seen& s = gNodes[node];
+		s.seen = frame;
+		if (hidden) s.hidden = frame;
+		ReleaseSRWLockExclusive(&gLock);
+	}
+	static AnimCost::Class Classify(void* node, uint32_t now) {
+		AcquireSRWLockShared(&gLock);
+		auto it = gNodes.find(node);
+		AnimCost::Class c = AnimCost::kOutside;
+		if (it != gNodes.end()) {
+			if (it->second.hidden + 1 >= now) c = AnimCost::kHidden;
+			else if (it->second.seen + 2 >= now) c = AnimCost::kDrawn;
+		}
+		ReleaseSRWLockShared(&gLock);
+		return c;
+	}
+	static void Prune(uint32_t now) {
+		AcquireSRWLockExclusive(&gLock);
+		for (auto it = gNodes.begin(); it != gNodes.end();)
+			it = it->second.seen + 600 < now ? gNodes.erase(it) : std::next(it);
+		ReleaseSRWLockExclusive(&gLock);
+	}
+	static LONG64 Ticks(const LARGE_INTEGER& a) {
+		LARGE_INTEGER b;
+		QueryPerformanceCounter(&b);
+		return b.QuadPart - a.QuadPart;
 	}
 }
 static bool gDepthGrows = true, gLoggedFirst = false;
@@ -737,12 +813,12 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 	Stats::Moving& st = isActor ? gStats.actor : gStats.door;
 	Record& rec = gRecords[node];
 	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
-	if (rec.lastSeen == 0 || rec.formID != formID || rec.actor != isActor || rec.door == isActor) {
+	if (rec.lastSeen == 0 || rec.formID != formID || rec.actor != isActor || rec.door == isActor || rec.land) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = formID;
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
-		rec.oriented = false; rec.boxPartial = false; rec.tree = false;
+		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.land = false;
 		rec.actor = isActor;
 		rec.door = !isActor;
 		Shape s{};
@@ -779,6 +855,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { st.hidden += 1; st.hiddenGeoms += rec.geoms; }
 	if (isActor && hide && gCullingOn) AnimCost::Mark(ref, gFrame, true);
+	if (kDevTools && hide && gCullingOn) CellCost::Mark(node, gFrame, true);
 	return hide;
 }
 
@@ -788,6 +865,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		if (!gTreesOn) return false;
 	}
 	gStats.topFade += 1;
+	if (kDevTools) CellCost::Mark(node, gFrame, false);
 	void* ref = Game::At<void*>(node, Game::Fade_LinkedRef);
 	if (!ref) { gStats.noRef += 1; return false; }
 	const uint8_t refType = Game::At<uint8_t>(ref, Game::Form_Type);
@@ -836,7 +914,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	const uint32_t formID = Game::At<uint32_t>(ref, Game::Form_ID);
 	const float* pos = &Game::At<float>(node, Game::Ni_WorldTranslate);
 	const float scale = Game::At<float>(node, Game::Ni_WorldScale);
-	const bool same = rec.lastSeen != 0 && !rec.actor && !rec.door && rec.tree == tree && rec.formID == formID && rec.scale == scale &&
+	const bool same = rec.lastSeen != 0 && !rec.actor && !rec.door && !rec.land && rec.tree == tree && rec.formID == formID && rec.scale == scale &&
 		rec.pos[0] == pos[0] && rec.pos[1] == pos[1] && rec.pos[2] == pos[2];
 	if (!same) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
@@ -846,6 +924,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
 		rec.actor = false;
 		rec.door = false;
+		rec.land = false;
 		rec.tree = tree;
 		RebuildShape(node, bound, rec);
 	} else if (rec.boxGen != gBoxGen || rec.boxPartial) {
@@ -870,6 +949,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
+	if (kDevTools && hide && gCullingOn) CellCost::Mark(node, gFrame, true);
 	if (mult == Game::kLodImposter) {
 		gStats.impCands += 1;
 		gStats.impGeoms += rec.geoms;
@@ -889,6 +969,59 @@ static void OnFault(const char* where) {
 }
 
 // True when the object is to be hidden. An exception draws it (and switches the plugin off).
+// Land quadrants: the box is the quadrant's own multibound AABB (the land's real height range), plus fLandMargin up
+// and down. Static: built once, kept while the AABB stays where it was. Hidden on the same rule as objects.
+static bool CollectLand(void* node) {
+	gStats.landSeen += 1;
+	if (!gLandOn || Game::At<uint16_t>(node, Game::Node_ChildSize) != 1) return false;
+	void* mb = Game::At<void*>(node, Game::MBNode_MultiBound);
+	void* shape = mb ? Game::At<void*>(mb, Game::MB_Shape) : nullptr;
+	void* child = *Game::At<void**>(node, Game::Node_ChildBase);
+	if (!shape || !child) return false;
+	const float* c = &Game::At<float>(shape, Game::MBAABB_Center);
+	const float* h = &Game::At<float>(shape, Game::MBAABB_HalfExtents);
+	if (h[0] != 1024.0f || h[1] != 1024.0f || !(h[2] >= 0.0f && h[2] < 100000.0f)) return false;   // not a land quadrant
+	if (!IsKindOf(child, Game::RTTI_NiGeometry)) return false;
+	gStats.landQuads += 1;
+	Record& rec = gRecords[node];
+	if (rec.lastSeen == 0 || !rec.land || rec.pos[0] != c[0] || rec.pos[1] != c[1] || rec.pos[2] != c[2] || rec.scale != h[2]) {
+		if (rec.lastSeen != 0) gStats.identityResets += 1;
+		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
+		rec.formID = 0;
+		rec.pos[0] = c[0]; rec.pos[1] = c[1]; rec.pos[2] = c[2];
+		rec.scale = h[2];
+		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
+		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.actor = false; rec.door = false;
+		rec.land = true;
+		rec.geoms = 1;
+		for (int i = 0; i < 3; ++i) {
+			const float m = i == 2 ? gSet.landMargin : 0.0f;
+			rec.mn[i] = c[i] - h[i] - m;
+			rec.mx[i] = c[i] + h[i] + m;
+		}
+		OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
+	}
+	rec.lastSeen = gFrame;
+	rec.boxGen = gBoxGen;
+	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { gStats.landNear += 1; return false; }
+	gStats.landCands += 1;
+	bool hide = false;
+	if (rec.answered && rec.zeroStreak >= 2) {
+		gStats.landCovered += 1;
+		bool tooOld;
+		hide = AnswerUsable(rec, tooOld);
+		if (!hide) gStats.landGuard += 1;
+	}
+	gCandidates.push_back({ &rec, hide });
+	if (hide && gCullingOn) gStats.landHidden += 1;
+	return hide;
+}
+
+static bool SafeCollectLand(void* node) {
+	__try { return CollectLand(node); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting land"); return false; }
+}
+
 static bool SafeCollect(void* node, bool tree) {
 	__try { return Collect(node, tree); }
 	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting"); return false; }
@@ -1285,6 +1418,10 @@ static void LogBlock() {
 	};
 	logMoving("actors", gActorsOn, gStats.actor);
 	logMoving("doors, activators, terminals", gActivatorsOn, gStats.door);
+	Log("  land (%s): %.1f multibound nodes per frame drawn by the main view, %.1f land quadrants, %.1f near the camera, %.1f "
+		"tested | covered %.1f: hidden %.1f, camera guard / answer too old %.1f", gLandOn ? "on" : "off", gStats.landSeen / f,
+		gStats.landQuads / f, gStats.landNear / f, gStats.landCands / f, gStats.landCovered / f, gStats.landHidden / f,
+		gStats.landGuard / f);
 	{
 		using namespace AnimCost;
 		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
@@ -1305,6 +1442,26 @@ static void LogBlock() {
 		for (volatile LONG64& k : gSkipped) InterlockedExchange64(&k, 0);
 		for (Sum& m : gSum)
 			for (int h = 0; h < kClasses; ++h) { InterlockedExchange64(&m.ticks[h], 0); InterlockedExchange64(&m.calls[h], 0); }
+		Prune(gFrame);
+	}
+	if (CellCost::gHooked) {
+		using namespace CellCost;
+		using AnimCost::kDrawn; using AnimCost::kHidden; using AnimCost::kOutside;
+		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
+		const double objUs = (gObjTicks[kDrawn] + gObjTicks[kHidden] + gObjTicks[kOutside]) * us;
+		Log("  cell update (AI thread, per frame): Havok step %.0f us (%.1f world steps) | cell updates %.0f us (%.1f cells) = "
+			"interior Havok %.0f + animated objects %.0f + rest %.0f us | animated objects drawn / hidden by us / outside the "
+			"main view: %.0f / %.0f / %.0f us (%.1f / %.1f / %.1f objects)", gPhysTicks * us, gPhysCalls / f, gCellTicks * us,
+			gCellCalls / f, gPhysInCellTicks * us, objUs, gCellTicks * us - gPhysInCellTicks * us - objUs,
+			gObjTicks[kDrawn] * us, gObjTicks[kHidden] * us, gObjTicks[kOutside] * us, gObjCalls[kDrawn] / f,
+			gObjCalls[kHidden] / f, gObjCalls[kOutside] / f);
+		for (volatile LONG64* k : { &gPhysTicks, &gPhysCalls, &gPhysInCellTicks, &gCellTicks, &gCellCalls }) InterlockedExchange64(k, 0);
+		for (int c = 0; c < AnimCost::kClasses; ++c) { InterlockedExchange64(&gObjTicks[c], 0); InterlockedExchange64(&gObjCalls[c], 0); }
+		auto part = [&](Part p) { return gPartOrig[p] ? gPartTicks[p] * us : -1.0; };
+		Log("  cell update parts (AI thread, per frame; -1 = not hooked): Havok lock wait %.0f us | exterior cells incl. Havok step "
+			"%.0f us | queued parallel tasks %.0f us | collision damage %.0f us | projectiles %.0f us", part(kLock), part(kGrid),
+			part(kTasks), part(kDamage), part(kProjectiles));
+		for (int p = 0; p < kParts; ++p) { InterlockedExchange64(&gPartTicks[p], 0); InterlockedExchange64(&gPartCalls[p], 0); }
 		Prune(gFrame);
 	}
 	Log("  trees (SpeedTree, tree culling %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
@@ -1459,6 +1616,7 @@ static Opaque_t OrigOpaque = nullptr;
 typedef void(__thiscall* OnVisible_t)(void*, void*);
 static OnVisible_t OrigFadeOnVisible = nullptr;
 static OnVisible_t OrigTreeOnVisible = nullptr;
+static OnVisible_t OrigMultiBoundOnVisible = nullptr;
 
 static void __cdecl AccumulateHook(void* camera, void* scene, void* culler) {
 	const bool active = gSet.enabled && !gFaulted && camera && GetCurrentThreadId() == gMainThread;
@@ -1501,6 +1659,13 @@ static void __fastcall TreeOnVisibleHook(void* node, void*, void* culler) {
 	OrigTreeOnVisible(node, culler);
 }
 
+static void __fastcall MultiBoundOnVisibleHook(void* node, void*, void* culler) {
+	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread && gFadeDepth == 0 &&
+		SafeCollectLand(node) && gCullingOn && !gFaulted)
+		return;   // proven covered: the quadrant's land is not drawn
+	OrigMultiBoundOnVisible(node, culler);
+}
+
 static unsigned gOpaqueCalls = 0;
 
 static void __cdecl OpaqueHook(void* camera, void* accumulator) {
@@ -1535,20 +1700,13 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (kDevTools && gSet.compareKey && controls && !Game::IsInMenuMode() &&
 		Game::GetKeyboardButton(controls, gSet.compareKey, Game::KeyPressed)) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
-		// One feature at a time against the INI's settings: as set -> actors flipped -> oriented boxes flipped -> trees
-		// flipped -> as set.
-		gCompareMode = (gCompareMode + 1) % 7;
-		gActorsOn = gSet.actorCulling != (gCompareMode == 1);
-		const bool oriented = gSet.orientedBoxes != (gCompareMode == 2);
-		gTreesOn = gSet.treeCulling != (gCompareMode == 3);
-		gActivatorsOn = gSet.activatorCulling != (gCompareMode == 4);
-		gRevealOn = (gSet.revealDepth > 0.0f) != (gCompareMode == 5);
-		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 6);
-		if (oriented != gOrientedOn) { gOrientedOn = oriented; ++gBoxGen; }
+		// One feature at a time against the INI's settings: as set -> land flipped -> bone throttle flipped -> as set.
+		gCompareMode = (gCompareMode + 1) % 3;
+		gLandOn = gSet.landCulling != (gCompareMode == 1);
+		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 2);
 		gCompareMessage = true;
-		Log("[frame %u] compare key: actors %s, oriented boxes %s, trees %s, doors/activators %s, box growth %s, actor bone "
-			"throttle %s", gFrame, gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF",
-			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF", gAnimThrottleOn ? "ON" : "OFF");
+		Log("[frame %u] compare key: land %s, actor bone throttle %s", gFrame, gLandOn ? "ON" : "OFF",
+			gAnimThrottleOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
 	if (kDevTools) gStats.queryUs += MicrosSince(start);
@@ -1568,11 +1726,9 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[7] = { "as set in the INI", "actors switched", "oriented boxes switched", "trees switched",
-			"doors/activators switched", "box growth switched", "bone throttle switched" };
-		snprintf(message, sizeof(message), "Occlusion culling (%s): actors %s, boxes %s, trees %s, doors %s, growth %s, bones %s",
-			kWhat[gCompareMode], gActorsOn ? "ON" : "OFF", gOrientedOn ? "ON" : "OFF", gTreesOn ? "ON" : "OFF",
-			gActivatorsOn ? "ON" : "OFF", gRevealOn ? "ON" : "OFF", gAnimThrottleOn ? "half rate" : "every frame");
+		static const char* const kWhat[3] = { "as set in the INI", "land switched", "bone throttle switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): land %s, bones %s", kWhat[gCompareMode],
+			gLandOn ? "ON" : "OFF", gAnimThrottleOn ? "half rate" : "every frame");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1580,6 +1736,113 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		Game::ShowMessage(gCullingOn ? "Occlusion culling: ON" : "Occlusion culling: OFF (measuring only)", 0, nullptr, nullptr,
 			2.0f, true);
 	}
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Cell update timing (developer builds, measuring only): the AI thread's TES::UpdateCellAnimations runs the Havok
+// step (bhkWorld::Update) and each loaded cell's TESObjectCELL::UpdateManagedNodes, which updates every animated
+// reference's scene graph (signs, fans, doors...; trees only inside the view). Animated objects are split like
+// actors: drawn / hidden by us / not reached by the main view in the last two frames.
+
+typedef uintptr_t(__thiscall* bhkWorldUpdate_t)(void*);
+typedef void(__thiscall* CellUpdateManaged_t)(void*, float, bool);
+typedef void(__thiscall* FadeUpdateSelected_t)(void*, void*, uint32_t);
+
+static uintptr_t __fastcall bhkWorldUpdateHook(void* world, void*) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	const uintptr_t result = ((bhkWorldUpdate_t)Game::Fn_bhkWorldUpdate)(world);
+	const LONG64 t = CellCost::Ticks(a);
+	InterlockedAdd64(&CellCost::gPhysTicks, t);
+	InterlockedIncrement64(&CellCost::gPhysCalls);
+	if (CellCost::tInCell) InterlockedAdd64(&CellCost::gPhysInCellTicks, t);   // an interior's step, inside its cell update
+	return result;
+}
+
+static void __fastcall CellUpdateManagedHook(void* cell, void*, float time, bool largeOnly) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	++CellCost::tInCell;
+	((CellUpdateManaged_t)Game::Fn_CellUpdateManagedNodes)(cell, time, largeOnly);
+	--CellCost::tInCell;
+	InterlockedAdd64(&CellCost::gCellTicks, CellCost::Ticks(a));
+	InterlockedIncrement64(&CellCost::gCellCalls);
+}
+
+// Only the outermost fade node inside a cell update is timed (the animated reference's root; dropped items under the
+// cell's dynamic node count too).
+static void __fastcall FadeUpdateSelectedHook(void* node, void*, void* data, uint32_t flags) {
+	if (!CellCost::tInCell || CellCost::tInObject) {
+		((FadeUpdateSelected_t)Game::Fn_FadeUpdateSelected)(node, data, flags);
+		return;
+	}
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	++CellCost::tInObject;
+	((FadeUpdateSelected_t)Game::Fn_FadeUpdateSelected)(node, data, flags);
+	--CellCost::tInObject;
+	const LONG64 t = CellCost::Ticks(a);
+	const int c = CellCost::Classify(node, gFrame);
+	InterlockedAdd64(&CellCost::gObjTicks[c], t);
+	InterlockedIncrement64(&CellCost::gObjCalls[c]);
+}
+
+typedef void(__thiscall* LockHavok_t)(void*, int);
+typedef void(__thiscall* GridUpdate_t)(void*, float);
+typedef void(__thiscall* NoArgs_t)(void*);
+
+static void AddPart(CellCost::Part part, const LARGE_INTEGER& a) {
+	InterlockedAdd64(&CellCost::gPartTicks[part], CellCost::Ticks(a));
+	InterlockedIncrement64(&CellCost::gPartCalls[part]);
+}
+static void __fastcall LockHavokHook(void* tes, void*, int lock) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	((LockHavok_t)CellCost::gPartOrig[CellCost::kLock])(tes, lock);
+	AddPart(CellCost::kLock, a);
+}
+static void __fastcall GridUpdateHook(void* grid, void*, float time) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	((GridUpdate_t)CellCost::gPartOrig[CellCost::kGrid])(grid, time);
+	AddPart(CellCost::kGrid, a);
+}
+template <CellCost::Part kPart> static void __fastcall NoArgsHook(void* self, void*) {
+	LARGE_INTEGER a;
+	QueryPerformanceCounter(&a);
+	((NoArgs_t)CellCost::gPartOrig[kPart])(self);
+	AddPart(kPart, a);
+}
+
+// Only slots and calls that still point at the game's own function are taken.
+static void InstallCellTiming() {
+	struct { uintptr_t at, target; CellCost::Part part; void* hook; } parts[] = {
+		{ Game::Call_LockHavok, 0x00453860, CellCost::kLock, &LockHavokHook },
+		{ Game::Call_GridUpdate, 0x004BA9A0, CellCost::kGrid, &GridUpdateHook },
+		{ Game::Call_ParallelTasks, 0x0087AA90, CellCost::kTasks, &NoArgsHook<CellCost::kTasks> },
+		{ Game::Call_ObjectDamage, 0x00623640, CellCost::kDamage, &NoArgsHook<CellCost::kDamage> },
+		{ Game::Call_Projectiles, 0x00975080, CellCost::kProjectiles, &NoArgsHook<CellCost::kProjectiles> },
+	};
+	int taken = 0;
+	for (auto& p : parts)
+		if (*(uint8_t*)p.at == 0xE8 && p.at + 5 + *(int32_t*)(p.at + 1) == p.target) {
+			CellCost::gPartOrig[p.part] = ReplaceCall(p.at, p.hook);
+			++taken;
+		}
+	Log("Cell update parts timing: %d of 5 calls", taken);
+	int cells = 0;
+	for (uintptr_t at : Game::Call_CellUpdateManagedNodes)
+		if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_CellUpdateManagedNodes) {
+			ReplaceCall(at, &CellUpdateManagedHook);
+			++cells;
+		}
+	const bool physics = *(uintptr_t*)Game::Vtbl_bhkWorldUpdate == Game::Fn_bhkWorldUpdate;
+	if (physics) ReplaceVirtual(Game::Vtbl_bhkWorldUpdate, &bhkWorldUpdateHook);
+	const bool objects = *(uintptr_t*)Game::Vtbl_FadeUpdateSelected == Game::Fn_FadeUpdateSelected;
+	if (objects) ReplaceVirtual(Game::Vtbl_FadeUpdateSelected, &FadeUpdateSelectedHook);
+	CellCost::gHooked = cells > 0;
+	Log("Cell update timing: %d of 2 cell update calls, Havok step %s, animated objects %s", cells, physics ? "hooked" : "NOT hooked",
+		objects ? "hooked" : "NOT hooked");
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1690,10 +1953,16 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	}
 	OrigFadeOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_FadeOnVisible, &FadeOnVisibleHook);
 	OrigTreeOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_TreeOnVisible, &TreeOnVisibleHook);
+	// lStewieAl's Tweaks replaces this slot with its own copy of the game's function (Rendering::InitHooks), so the
+	// hook chains to whatever is there.
+	OrigMultiBoundOnVisible = (OnVisible_t)ReplaceVirtual(Game::Vtbl_MultiBoundOnVisible, &MultiBoundOnVisibleHook);
+	Log("Land hook installed: BSMultiBoundNode::OnVisible -> 0x%08X%s", (unsigned)(uintptr_t)OrigMultiBoundOnVisible,
+		(uintptr_t)OrigMultiBoundOnVisible != Game::Fn_MultiBoundOnVisible ? " (through another plugin's hook, e.g. Stewie's Tweaks)" : "");
 	Log("Tree hook installed: BSTreeNode::OnVisible -> 0x%08X%s", (unsigned)(uintptr_t)OrigTreeOnVisible,
 		(uintptr_t)OrigTreeOnVisible != 0x0066BF50 ? " (through another plugin's hook)" : "");
 	OrigLampTest = (LampTest_t)ReplaceCall(Game::Call_LampTest, &LampTestHook);
 	InstallAnimHooks();
+	if (kDevTools) InstallCellTiming();
 	Log(OrigLampTest ? "Lamp test hook installed -> 0x%08X%s" : "0x%08X: the lamp test call is not a call; lamps are left alone%s",
 		OrigLampTest ? (unsigned)(uintptr_t)OrigLampTest : (unsigned)Game::Call_LampTest,
 		OrigLampTest && (uintptr_t)OrigLampTest != 0x00B9E970 ? " (through another plugin's hook, e.g. NVR's KeepLampsInView)" : "");
@@ -1706,6 +1975,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gActivatorsOn = gSet.activatorCulling;
 	gRevealOn = gSet.revealDepth > 0.0f;
 	gAnimThrottleOn = gSet.animThrottle;
+	gLandOn = gSet.landCulling;
 	if (kDevTools)
 		Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 			gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);
