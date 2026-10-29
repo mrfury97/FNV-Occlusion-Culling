@@ -125,7 +125,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.2.0";
+constexpr const char* kVersion = "1.2.1-dev2";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -429,6 +429,12 @@ struct Record {
 	bool tree = false;                         // a SpeedTree (BSTreeNode): box = bound cube + leaf margin
 	bool land = false;                         // a land quadrant, terrain LOD chunk or grass group: box = its multibound AABB
 	float boxHalf[3] = {};                     // that AABB's half extents (with pos = its centre: the identity)
+	uint32_t hiddenFrame = 0;                  // newest frame we hid it in
+	uint32_t hideStart = 0;                    // first frame of that hidden spell
+	uint32_t flapFrame = 0;                    // first quick re-hide of the current window
+	uint8_t flaps = 0;                         // quick re-hides in that window
+	bool unstable = false;                     // kept hiding its own box: never tested or hidden again (see CheckFlap)
+	bool sawPixels = false;                    // an ungrown box of it showed pixels since we last hid it
 	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
 	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
 };
@@ -506,6 +512,7 @@ struct Stats {
 	double clippedBoxes = 0;        // boxes reaching behind the camera or far off screen, tested cut to what can be seen
 	double camMismatch = 0, noDepth = 0, identityResets = 0;
 	double hidden = 0, hiddenGeoms = 0;                    // actually not drawn (hiding on)
+	double unstableSkipped = 0, unstableMarked = 0;        // objects that hid their own box (CheckFlap)
 	double lampsOn = 0, lampsTested = 0, lampsNear = 0, lampsCovered = 0, lampShapes = 0, lampShapesCovered = 0;
 	double lampsOff = 0, lampFlags = 0, lampsWaiting = 0;
 	double onMs = 0, onFrames = 0, offMs = 0, offFrames = 0;   // frame time while hiding is on / off
@@ -823,6 +830,46 @@ static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos,
 // Things that move (NPCs and creatures; doors, activators and terminals): box = world bound sphere + margin, every
 // frame; hidden while the current bound is still inside the box of the newest 0-pixel answer (and the camera guard
 // holds, as for objects).
+// Flicker guard. An object whose test box lies behind its own surface hides its own box: drawn, the box is covered and
+// after two 0-pixel answers the object is hidden; hidden, the box shows at the very next answer and it is drawn again.
+// It blinks with a period of about four frames, hidden one or two frames each time. Looking around makes short
+// show/hide cycles too, but not that short and not that regular, so a cycle counts only when the hidden spell lasted
+// at most kFlapSpell frames and the object was hidden again at most kFlapGap frames after its own (ungrown) box showed
+// pixels. After kFlapLimit such cycles within kFlapWindow frames the object is never tested or hidden again (until
+// another object takes its place), and the log says which one.
+constexpr uint32_t kFlapGap = 6, kFlapSpell = 3, kFlapWindow = 120;
+constexpr int kFlapLimit = 6;
+
+static bool CheckFlap(Record& rec, bool hide, void* ref) {
+	if (!hide || !gCullingOn) return hide;
+	// Shown briefly because its own (ungrown) box showed pixels, now hidden again. Shows that come from the camera guard
+	// or from boxes grown while moving (a margin's pixels, then covered again) are not counted.
+	const bool newSpell = rec.hiddenFrame + 1 < gFrame;
+	if (newSpell && rec.hiddenFrame && rec.sawPixels && gFrame - rec.hiddenFrame <= kFlapGap &&
+		rec.hiddenFrame - rec.hideStart + 1 <= kFlapSpell) {
+		if (!rec.flaps || gFrame - rec.flapFrame > kFlapWindow) { rec.flaps = 0; rec.flapFrame = gFrame; }
+		if (++rec.flaps >= kFlapLimit) {
+			rec.unstable = true;
+			gStats.unstableMarked += 1;
+			static int logged = 0;
+			if (logged++ < 32) {
+				void* base = ref ? Game::At<void*>(ref, Game::Ref_Base) : nullptr;
+				Log("[frame %u] %s %08X (base %08X) kept hiding its own test box (it blinked): never hidden again | box %.0f x %.0f "
+					"x %.0f %s at (%.0f, %.0f, %.0f)", gFrame, rec.land ? "land/LOD/grass box" : rec.actor ? "actor" : rec.door ?
+					"door/activator" : rec.tree ? "tree" : "object", ref ? Game::At<uint32_t>(ref, Game::Form_ID) : 0u,
+					base ? Game::At<uint32_t>(base, Game::Form_ID) : 0u, rec.mx[0] - rec.mn[0], rec.mx[1] - rec.mn[1],
+					rec.mx[2] - rec.mn[2], rec.oriented ? "(oriented, from its vertices)" : "(along the world axes)",
+					(rec.mn[0] + rec.mx[0]) * 0.5f, (rec.mn[1] + rec.mx[1]) * 0.5f, (rec.mn[2] + rec.mx[2]) * 0.5f);
+			}
+			return false;
+		}
+	}
+	if (newSpell) rec.hideStart = gFrame;
+	rec.hiddenFrame = gFrame;
+	rec.sawPixels = false;
+	return true;
+}
+
 static bool CollectMoving(void* node, void* ref, const float* bound, bool isActor) {
 	Stats::Moving& st = isActor ? gStats.actor : gStats.door;
 	Record& rec = gRecords[node];
@@ -832,6 +879,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = formID;
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
+		rec.unstable = false; rec.flaps = 0; rec.hiddenFrame = 0; rec.hideStart = 0; rec.sawPixels = false;
 		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.land = false;
 		rec.actor = isActor;
 		rec.door = !isActor;
@@ -853,6 +901,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 	OcclusionMath::AxisCorners(rec.mn, rec.mx, rec.corner);
 	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { st.nearCam += 1; return false; }
 
+	if (rec.unstable) { gStats.unstableSkipped += 1; return false; }
 	st.cands += 1;
 	st.geoms += rec.geoms;
 	bool hide = false;
@@ -866,6 +915,7 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 		else if (tooOld) st.old += 1;
 		else st.guard += 1;
 	}
+	hide = CheckFlap(rec, hide, ref);
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { st.hidden += 1; st.hiddenGeoms += rec.geoms; }
 	if (isActor && hide && gCullingOn) gSeenActors.Mark(ref, ref, gFrame, true);
@@ -936,6 +986,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		rec.formID = formID; rec.scale = scale;
 		rec.pos[0] = pos[0]; rec.pos[1] = pos[1]; rec.pos[2] = pos[2];
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
+		rec.unstable = false; rec.flaps = 0; rec.hiddenFrame = 0; rec.hideStart = 0; rec.sawPixels = false;
 		rec.actor = false;
 		rec.door = false;
 		rec.land = false;
@@ -950,6 +1001,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx);
 	if (distance < gSet.nearDistance) { gStats.nearSkip += 1; return false; }
 
+	if (rec.unstable) { gStats.unstableSkipped += 1; return false; }
 	gStats.candidates += 1;
 	gStats.candGeoms += rec.geoms;
 	bool hide = false;
@@ -960,6 +1012,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		else if (tooOld) gStats.tooOld += 1;
 		else gStats.guardBlocked += 1;
 	}
+	hide = CheckFlap(rec, hide, ref);
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
@@ -1011,6 +1064,7 @@ static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind k
 		rec.pos[0] = c[0]; rec.pos[1] = c[1]; rec.pos[2] = c[2];
 		rec.boxHalf[0] = h[0]; rec.boxHalf[1] = h[1]; rec.boxHalf[2] = h[2];
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
+		rec.unstable = false; rec.flaps = 0; rec.hiddenFrame = 0; rec.hideStart = 0; rec.sawPixels = false;
 		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.actor = false; rec.door = false;
 		rec.land = true;
 		rec.geoms = 1;
@@ -1024,6 +1078,7 @@ static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind k
 	rec.lastSeen = gFrame;
 	rec.boxGen = gBoxGen;
 	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { *st[0] += 1; return false; }
+	if (rec.unstable) { gStats.unstableSkipped += 1; return false; }
 	*st[1] += 1;
 	bool hide = false;
 	if (rec.answered && rec.zeroStreak >= 2) {
@@ -1032,6 +1087,7 @@ static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind k
 		hide = AnswerUsable(rec, tooOld);
 		if (!hide) *st[4] += 1;
 	}
+	hide = CheckFlap(rec, hide, nullptr);
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) *st[3] += 1;
 	return hide;
@@ -1295,6 +1351,7 @@ static __declspec(noinline) void RunQueries(void* camera) {
 			for (int i = 0; i < 3; ++i) { rec.amn[i] = rec.tmn[i]; rec.amx[i] = rec.tmx[i]; }
 			rec.pixels = pixels;
 			if (pixels) {
+				if (!rec.issuedGrown) rec.sawPixels = true;   // the flicker guard counts only real (ungrown) sightings
 				// Pixels from a grown box: maybe only the margin. Drawn now, tested next frame (see the header).
 				if (rec.issuedGrown && (rec.zeroStreak > 0 || rec.afterGrown)) {
 					if (!rec.afterGrown) rec.streakBeforeGrown = rec.zeroStreak;   // keep the first one through a run of them
@@ -1456,8 +1513,10 @@ static __declspec(noinline) void RunQueries(void* camera) {
 				const Record& rec = *c.rec;
 				if (!rec.answered) continue;
 				gStates.Set(4, c.wouldHide ? D3DZB_FALSE : D3DZB_TRUE);
+				// NPCs and creatures: magenta hidden, cyan drawn; everything else: red hidden, green drawn.
+				const uint32_t colour = rec.actor ? (c.wouldHide ? 0xFFFF20FF : 0xFF20FFFF) : (c.wouldHide ? 0xFFFF2020 : 0xFF20FF20);
 				if (OcclusionMath::ProjectCorners(rec.corner, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
-					(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, c.wouldHide ? 0xFFFF2020 : 0xFF20FF20, screen))
+					(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, colour, screen))
 					device->DrawPrimitiveUP(D3DPT_LINELIST, 18, screen, sizeof(OcclusionMath::ScreenVertex));
 			}
 		}
@@ -1563,6 +1622,8 @@ static void LogBlock() {
 		}
 		InterlockedExchange64(&gParticlesOther, 0);
 	}
+	Log("  flicker guard: %.0f objects newly found hiding their own box in this block, %.1f such objects per frame left drawn",
+		gStats.unstableMarked, gStats.unstableSkipped / f);
 	Log("  trees (SpeedTree, tree culling %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
 		"(%.0f shapes); counted with the objects above and below", gTreesOn ? "on" : "off", gStats.treeSeen / f, gStats.treeCands / f,
 		gStats.treeGeoms / f, gStats.treeHidden / f, gStats.treeHiddenGeoms / f);
