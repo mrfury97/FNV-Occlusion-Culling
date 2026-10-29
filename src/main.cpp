@@ -100,7 +100,7 @@
 // bLightListChanged) to rebuild their lamp passes when that changes. Each lamp's reach (a box around its radius,
 // NiLight m_kSpec.r) is tested with the same occlusion queries: when no visible pixel lies inside it, nothing the lamp
 // could light is on screen. Measured always; with bLampCulling=1 such a lamp is also switched off for the main view
-// (after three 0-pixel answers, the camera guard as for objects, never within fNearDistance of the camera), with the
+// (after kLampOffAnswers 0-pixel answers and at least kLampHoldFrames after it last came back on, the camera guard as for objects, never within fNearDistance of the camera), with the
 // value the game and NVR left restored before each next test and the lit shapes marked to rebuild when ours changes.
 
 #include <windows.h>
@@ -125,7 +125,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.2.1";
+constexpr const char* kVersion = "1.2.2";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -456,6 +456,7 @@ struct Lamp {
 	bool hiddenApplied = false;    // our switch-off as of the last main-view frame (shapes marked when it changes)
 	bool candidate = false;        // tested this frame
 	bool nearCamera = false;
+	uint32_t onSince = 0;          // frame our switch-off last ended (the lamp came back on)
 };
 static std::unordered_map<void*, Lamp> gLamps;
 static std::vector<Lamp*> gLampCandidates;
@@ -708,6 +709,13 @@ static void WalkShapes(void* object, int depth, Shape& s) {
 	}
 }
 
+// A box measured from the vertices is exactly tight, so for a flat face (a wall piece) the side facing the camera lies
+// on the visible surface itself: the box's and the wall's depths tie, the depth test gives it to the wall, the box
+// counts as covered by its own object and the object blinks (Vault 21's wall pieces did). Such boxes are padded by
+// kTightBoxMargin units on every side, enough to sit clearly in front of the surface at any distance in reversed depth
+// and to tens of thousands of units in 24-bit depth.
+constexpr float kTightBoxMargin = 4.0f;
+
 // The old box is the union of the shapes' bound cubes, cut to the node's own bound cube (both contain every shape).
 // With oriented boxes on, the shapes' measured extents give two more boxes, in the object's frame and along the world
 // axes (each cut to the node's bound too); the smallest box holding the whole object is tested.
@@ -762,6 +770,10 @@ static void RebuildShape(void* node, const float* bound, Record& rec) {
 			lmn[i] = max(s.omn[i], c[i] - bound[3]); lmx[i] = min(s.omx[i], c[i] + bound[3]);
 			axisOk = axisOk && wmn[i] <= wmx[i];
 			localOk = localOk && lmn[i] <= lmx[i];
+		}
+		for (int i = 0; i < 3; ++i) {   // padded off their own surfaces (see kTightBoxMargin)
+			wmn[i] -= kTightBoxMargin; wmx[i] += kTightBoxMargin;
+			lmn[i] -= kTightBoxMargin; lmx[i] += kTightBoxMargin;
 		}
 		if (axisOk && OcclusionMath::BoxVolume(wmn, wmx) < volume) {
 			for (int i = 0; i < 3; ++i) { rec.mn[i] = wmn[i]; rec.mx[i] = wmx[i]; }
@@ -837,8 +849,10 @@ static bool AnswerUsableAt(const Record& rec, bool& tooOld, const float* nowPos,
 // at most kFlapSpell frames and the object was hidden again at most kFlapGap frames after its own (ungrown) box showed
 // pixels. After kFlapLimit such cycles within kFlapWindow frames the object is never tested or hidden again (until
 // another object takes its place), and the log says which one.
-constexpr uint32_t kFlapGap = 6, kFlapSpell = 3, kFlapWindow = 120;
-constexpr int kFlapLimit = 6;
+// A real blinker (period ~4 frames: shown, two 0-pixel answers, hidden one or two frames) makes ~15 cycles a second, so
+// 8 within 2 s; looking around in Vault 21 still made the odd shorter run of 6 (1.2.2-dev1), not 8 this tight.
+constexpr uint32_t kFlapGap = 4, kFlapSpell = 2, kFlapWindow = 120;
+constexpr int kFlapLimit = 8;
 
 static bool CheckFlap(Record& rec, bool hide, void* ref) {
 	if (!hide || !gCullingOn) return hide;
@@ -1670,6 +1684,13 @@ static void LogBlock() {
 // ---------------------------------------------------------------------------------------------------------------
 // Hooks
 
+// Lamp hysteresis. A lamp whose reach is only just visible (a sliver at a doorway, a corner) flips between 0 and a few
+// pixels as TAA jitters the view by a fraction of a pixel each frame; every flip relights the shapes it touches, which
+// shows as flickering lights (Vault 21: 1-11 lamps switched each frame with the camera still). So a lamp is switched
+// off only after kLampOffAnswers 0-pixel answers in a row, and once it comes back on it stays on for kLampHoldFrames.
+constexpr uint8_t kLampOffAnswers = 6;
+constexpr uint32_t kLampHoldFrames = 45;
+
 // Marks every shape the lamp lights to rebuild its lamp list (as TestFrustumCull does when a lamp turns on or off).
 static void MarkLampShapes(void* light) {
 	struct Item { Item* next; Item* prev; void* element; };
@@ -1723,7 +1744,7 @@ static __declspec(noinline) void LampNote(void* light, void* culler) {
 			gStats.lampShapes += shapes;
 			gLampCandidates.push_back(&lamp);
 			if (lamp.nearCamera) gStats.lampsNear += 1;
-			else if (rec.answered && rec.zeroStreak >= 3) {
+			else if (rec.answered && rec.zeroStreak >= kLampOffAnswers && gFrame - lamp.onSince >= kLampHoldFrames) {
 				bool tooOld;
 				if (camera == gMainCamera ? AnswerUsable(rec, tooOld) : AnswerUsableAt(rec, tooOld, camPos, camRot)) {
 					lamp.decision = true;
@@ -1743,6 +1764,7 @@ static __declspec(noinline) void LampNote(void* light, void* culler) {
 	}
 	if (apply != lamp.hiddenApplied) {
 		MarkLampShapes(light);
+		if (!apply) lamp.onSince = gFrame;
 		lamp.hiddenApplied = apply;
 	}
 }
