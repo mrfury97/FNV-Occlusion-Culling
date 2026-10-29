@@ -19,9 +19,9 @@ HEADER = [
     "; Occlusion Culling - Data\\NVSE\\Plugins\\OcclusionCulling.ini (read when the game starts)",
     "; Objects, NPCs and creatures, doors and activators, SpeedTree trees, land, distant terrain LOD, grass and lamps",
     "; that the graphics card proves are fully covered by what is already drawn are not drawn in the main view (lamps:",
-    "; switched off there). NPCs that are not drawn update their bones less often. Shadows, reflections, the player and",
-    "; anything near the camera are never touched. Start-up lines and any error go to logs\\OcclusionCulling.log in the",
-    "; game folder.",
+    "; switched off there). NPCs and particle systems that are not drawn update less often. Shadows, reflections, the",
+    "; player and anything near the camera are never touched. Start-up lines and any error go to",
+    "; logs\\OcclusionCulling.log in the game folder.",
 ]
 
 raw = open(src, "rb").read()

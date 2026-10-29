@@ -1,10 +1,16 @@
 // Occlusion Culling - NVSE
 //
-// Phase 2: objects the graphics card has shown to be fully covered are not drawn in the main view (their
-// BSFadeNode::OnVisible is skipped, exactly as the engine skips an object outside the view). The plugin finds the
-// objects the main view draws, asks the card whether each large one is covered by what is already drawn (occlusion
-// queries) and hides only those proven covered by recent answers (rules below). A hotkey (iToggleKey) switches the
-// hiding on and off while playing; the log keeps measuring either way and compares the frame time of the two states.
+// What the graphics card has shown to be fully covered by what is already drawn is not drawn in the main view: its
+// OnVisible is skipped, exactly as the engine skips something outside the view. The plugin finds what the main view
+// draws, asks the card whether each candidate's box is covered (occlusion queries) and hides only what recent answers
+// prove covered (rules below). Candidates:
+//   - objects (BSFadeNode roots, tight boxes from their own vertices), imposters, NPCs and creatures, doors,
+//     activators and terminals, SpeedTree trees (BSTreeNode);
+//   - land squares, distant terrain LOD chunks and grass groups (BSMultiBoundNode, see "Land" below);
+//   - lamps: a lamp whose whole reach is covered is switched off for the main view.
+// Two throttles use the same knowledge: NPCs the main view does not draw update their bones, and particle systems on
+// objects it does not draw step, only every few frames. A hotkey (iToggleKey) switches it all on and off while
+// playing; developer builds keep measuring either way and compare the frame time of the two states.
 //
 // How (FalloutNV.exe 1.4.0.525, checked against the decompile and in IDA):
 //   - TESMain::DrawScene 0x873200 gathers the main view with BSShaderUtil::AccumulateScene (call at 0x87415B: main
@@ -14,8 +20,9 @@
 //   - Every placed object's root is a BSFadeNode whose pLinkedObj (+0xCC) is its reference. Its OnVisible (vtable slot
 //     53, 0x10A9064 in BSFadeNode's vtable, only BSFadeNode itself uses it) runs only when the culler found it inside the
 //     view. While the main AccumulateScene runs with the main culler, each top-level fade node is classified there:
-//     actors, doors, lights, activators, terminals, projectiles, distant LOD and the like are never candidates; nor is
-//     anything small (fMinRadius) or close to the camera (fNearDistance).
+//     NPCs and doors/activators get their own boxes (rebuilt every frame); lights, projectiles and effects, terminal
+//     screens and disabled references are never candidates; distant LOD objects only with bDistantLOD; nor is anything
+//     small (fMinRadius) or close to the camera (fNearDistance).
 //   - Right after the opaque pass the depth buffer holds the finished scene (the engine runs its own VATS query at the
 //     same spot). Each candidate's box (union of its shapes' bounds) is drawn there with colour and depth writes off
 //     inside a D3D occlusion query, in the renderer's own view and projection (NiDX9Renderer +0x980/+0x9C0) and
@@ -62,6 +69,16 @@
 // 20% of the radius plus fTreeMargin. FalloutNV.esm places about 18,400 of them (WastelandShrub01, EuonymusBush01,
 // WhiteOak01); Joshua trees and most dead trees are ordinary statics.
 //
+// Boxes reaching behind the camera or far past a screen edge are cut on the CPU (OcclusionMath::ProjectCornersClipped:
+// each face clipped at w = 1 and kClipGuard screens to the sides, depth clamped to the nearest value, which can only
+// make a box easier to see) and tested like the others.
+//
+// Land ([Land], [Grass]): TESObjectCELL::Load3D gives each cell four land squares (BSMultiBoundNode with an AABB of the
+// land's own height range); terrain LOD chunks below the scene's LandLOD node and grass groups (one TallGrassTriStrips
+// under the Grass node) are BSMultiBoundNodes too. Each one inside the view (the game's own WithinFrustum test on the
+// main culler's planes) is tested with that box and hidden on the same rules. lStewieAl's Tweaks replaces
+// BSMultiBoundNode::OnVisible with its own copy; the hook chains through whatever holds the slot.
+//
 // (0.8.1 drew all of a frame's boxes from one vertex buffer; it saved about 5% of the drawing time, 30 us at 1000
 // tests, for a buffer that had to be released before every device reset, so 0.8.2 went back to one draw per box.)
 //
@@ -70,7 +87,9 @@
 // stepping out from a wall). Rotation moves occluder and object together; a sideways move slides near edges across the
 // screen faster than what lies behind them. So every frame the boxes of things whose last answer was 0 pixels grow on
 // screen by how far the camera's move this frame slides an edge fRevealDepth units away (OcclusionMath::RevealPixels),
-// and they show pixels a frame early instead. Standing still nothing grows; a lower fRevealDepth grows more.
+// and they show pixels a frame early instead. Standing still nothing grows; a lower fRevealDepth grows more. Moving the
+// corners outward can leave slivers of the original outline uncovered (math_test shows it), so a grown box is drawn
+// together with its original inside the same query.
 // Moves under kRevealMinMove units a frame (idle sway, creeping) grow nothing. When a grown box shows pixels, the object
 // is drawn but tested again the very next frame, and one 0-pixel answer puts back the covered state it had before (a
 // grown box's pixels need not be the object's own), so an early reveal costs about two frames of drawing, not six.
@@ -93,7 +112,6 @@
 #include <cstring>
 #include <share.h>
 #include <algorithm>
-#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -107,7 +125,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.1.0";
+constexpr const char* kVersion = "1.2.0-dev2";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -153,6 +171,9 @@ struct Settings {
 	bool animThrottle = true;        // actors the main view does not draw update their bones every animInterval frames
 	int animInterval = 2;
 	float animNearDistance = 512.0f; // actors closer than this to the camera always update every frame
+	bool particleThrottle = true;    // particle systems on objects the main view does not draw update every particleInterval frames
+	int particleInterval = 3;
+	float particleNearDistance = 512.0f;
 	bool activatorCulling = true;    // doors, activators, talking activators and terminals are tested and hidden too
 	float activatorMargin = 16.0f;   // added around their bound (plus 5% of its radius)
 	bool treeCulling = true;         // SpeedTree trees and shrubs are tested and hidden too
@@ -201,6 +222,9 @@ static void LoadSettings() {
 	gSet.animThrottle = readI("Actors", "bAnimThrottle", 1, 0, 1) != 0;
 	gSet.animInterval = readI("Actors", "iAnimInterval", 2, 1, 8);
 	gSet.animNearDistance = readF("Actors", "fAnimNearDistance", 512.0f, 0.0f, 100000.0f);
+	gSet.particleThrottle = readI("Particles", "bParticleThrottle", 1, 0, 1) != 0;
+	gSet.particleInterval = readI("Particles", "iParticleInterval", 3, 1, 8);
+	gSet.particleNearDistance = readF("Particles", "fParticleNearDistance", 512.0f, 0.0f, 100000.0f);
 	gSet.activatorCulling = readI("Activators", "bActivatorCulling", 1, 0, 1) != 0;
 	gSet.activatorMargin = readF("Activators", "fActivatorMargin", 16.0f, 0.0f, 512.0f);
 	Log("Doors, activators, terminals: %s, margin 5%% + %.0f units",
@@ -221,6 +245,11 @@ static void LoadSettings() {
 			gSet.animInterval);
 	else
 		Log("Actor bones: every frame for all actors (bAnimThrottle=0 or iAnimInterval=1)");
+	if (gSet.particleThrottle && gSet.particleInterval > 1)
+		Log("Particles: on objects behind cover or outside the view, %.0f+ units away, update every %d frames",
+			gSet.particleNearDistance, gSet.particleInterval);
+	else
+		Log("Particles: every frame (bParticleThrottle=0 or iParticleInterval=1)");
 	Log("Land: %s, height margin %.0f units", gSet.landCulling ? "quadrants tested and hidden like objects" :
 		"never touched (bLandCulling=0)", gSet.landMargin);
 	Log("Distant terrain LOD: %s", gSet.lodTerrain ? "chunks tested and hidden like land" : "never touched (bTerrainLOD=0)");
@@ -288,12 +317,9 @@ namespace Game {
 	constexpr uintptr_t Call_MainOpaque = 0x00874180;       // TESMain::DrawScene -> RenderScenePreResolveDepth 0xB6BA20
 	constexpr uintptr_t Vtbl_FadeOnVisible = 0x010A9064;    // BSFadeNode vtable slot 53 -> BSFadeNode::OnVisible 0xB4E490
 	constexpr uintptr_t Vtbl_TreeOnVisible = 0x010669B8;    // BSTreeNode vtable slot 53 -> BSTreeNode::OnVisible 0x66BF50
-	// Actor animation steps (measured in developer builds). The three steps run on the AI threads and in parallel tasks.
-	constexpr uintptr_t Fn_ActorUpdateAnimation = 0x00888070;     // Actor::UpdateAnimation (AI thread: sequences, pose, tracking)
-	constexpr uintptr_t Fn_ActorUpdateAnimMovement = 0x008885A0;  // Actor::UpdateAnimMovement (parallel task: non-bip controllers, movement)
-	constexpr uintptr_t Fn_QueuedScenegraph = 0x00493930;         // Animation::UpdateQueuedScenegraph (after the AI join: bone transforms)
-	constexpr uintptr_t Vtbl_ActorUpdateAnimation[] = { 0x010844BC, 0x01086CD4, 0x01087314, 0x0108ACA4 };
-	constexpr uintptr_t Vtbl_ActorUpdateAnimMovement[] = { 0x010845A4, 0x01086DBC, 0x010873FC, 0x0108AD8C };
+	// Actor bones: each NPC's bone transforms are brought up to date after the AI join by
+	// Animation::UpdateQueuedScenegraph (ProcessLists::ParallelUpdateAnimationScenegraph 0x96C970).
+	constexpr uintptr_t Fn_QueuedScenegraph = 0x00493930;
 	constexpr uintptr_t Call_QueuedScenegraph[] = {
 		0x0096C8ED,   // ProcessLists::UpdateAnimationScenegraph (one thread)
 		0x0096CA73,   // ProcessLists::ParallelUpdateAnimationScenegraph (tasklets off)
@@ -301,22 +327,12 @@ namespace Game {
 	};
 	constexpr uintptr_t Anim_Actor = 0x04;                        // Animation::pActor
 	constexpr uintptr_t Fn_SetDelayUpdateScenegraph = 0x004939B0;   // Animation::SetDelayUpdateScenegraph(bool)
-	// Cell update on the AI thread (TES::UpdateCellAnimations 0x453550), measured in developer builds.
-	constexpr uintptr_t Fn_CellUpdateManagedNodes = 0x00551890;   // TESObjectCELL::UpdateManagedNodes(time, largeOnly)
-	constexpr uintptr_t Call_CellUpdateManagedNodes[] = {
-		0x00453608,   // TES::UpdateCellAnimations (interior)
-		0x004BAA98,   // GridCellArray::UpdateManagedNodes (each loaded exterior cell)
-	};
-	// The other calls in TES::UpdateCellAnimations (each checked against its target before it is taken)
-	constexpr uintptr_t Call_LockHavok = 0x004535EE;               // TES::LockHavokUpdateMT(true) 0x453860
-	constexpr uintptr_t Call_GridUpdate = 0x0045361F;              // GridCellArray::UpdateManagedNodes 0x4BA9A0
-	constexpr uintptr_t Call_ParallelTasks = 0x00453648;           // TaskQueueInterface::QueueParallelTaskProcessing 0x87AA90
-	constexpr uintptr_t Call_ObjectDamage = 0x00453654;            // FOCollisionListener::DealObjectDamage 0x623640
-	constexpr uintptr_t Call_Projectiles = 0x004536CF;             // ProcessLists::PostProcessProjectiles 0x975080
-	constexpr uintptr_t Vtbl_bhkWorldUpdate = 0x010C6AB8;          // bhkWorldM vtable slot 49 -> bhkWorld::Update
-	constexpr uintptr_t Fn_bhkWorldUpdate = 0x00C6AE70;
-	constexpr uintptr_t Vtbl_FadeUpdateSelected = 0x010A9038;      // BSFadeNode vtable slot 42 -> UpdateSelectedDownwardPass
-	constexpr uintptr_t Fn_FadeUpdateSelected = 0x00B4EA20;
+	// Particles: TESObjectCELL::RunQueuedParticleUpdates 0x552570 (main thread, after the frame) steps the particle
+	// systems under each node the AI thread's cell update (TESObjectCELL::UpdateManagedNodes 0x551890) queued: animated
+	// references' roots and the cell's dynamic node.
+	constexpr uintptr_t Call_ParticlesOnly = 0x005525E3;          // -> TESObjectCELL::UpdateParticlesOnly(NiNode*) 0x5526F0
+	constexpr uintptr_t Fn_ParticlesOnly = 0x005526F0;
+	constexpr uintptr_t Vtbl_BSFadeNode = 0x010A8F90;
 	// Land: TESObjectCELL::Load3D 0x545CF0 gives each cell's land node four BSMultiBoundNode quadrants (cull mode
 	// ALLPASS, one BSMultiBoundAABB each); TESObjectLAND::Attach3D 0x5374F0 puts the quadrant's land strips in child 0
 	// and sets the AABB to centre + (1024, 1024, height range / 2).
@@ -411,7 +427,8 @@ struct Record {
 	bool afterGrown = false;                   // a grown box showed pixels: tested next frame, one 0 restores the streak
 	uint8_t streakBeforeGrown = 0;             // the 0-pixel streak it had before that
 	bool tree = false;                         // a SpeedTree (BSTreeNode): box = bound cube + leaf margin
-	bool land = false;                         // a land quadrant (BSMultiBoundNode): box = its multibound AABB
+	bool land = false;                         // a land quadrant, terrain LOD chunk or grass group: box = its multibound AABB
+	float boxHalf[3] = {};                     // that AABB's half extents (with pos = its centre: the identity)
 	float tmn[3] = {}, tmx[3] = {};            // the box its pending query was drawn with
 	float amn[3] = {}, amx[3] = {};            // the box its newest answer was about
 };
@@ -457,7 +474,8 @@ static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
 static bool gRevealOn = true;       // fRevealDepth > 0, then the compare key
 static bool gLandOn = true;         // bLandCulling, then the compare key
 static bool gGrassOn = true;        // bGrassCulling, then the compare key
-static bool gAnimThrottleOn = true; // bAnimThrottle, then the compare key
+static bool gAnimThrottleOn = true; // bAnimThrottle, then the compare key (with the particle throttle)
+static bool gParticleThrottleOn = true;
 constexpr float kRevealMinMove = 0.5f;   // camera moves below this (units per frame) grow nothing
 // 0 the INI's settings, 1 land flipped, 2 grass flipped, 3 actor bone throttle flipped (the features still being compared)
 static int gCompareMode = 0;
@@ -501,7 +519,7 @@ struct Stats {
 		double noShapes = 0;
 	} actor, door;
 	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
-	double landSeen = 0, landQuads = 0, landNear = 0, landCands = 0, landCovered = 0, landHidden = 0, landGuard = 0;
+	double multiBoundSeen = 0, landQuads = 0, landNear = 0, landCands = 0, landCovered = 0, landHidden = 0, landGuard = 0;
 	double lodSeen = 0, lodNear = 0, lodCands = 0, lodCovered = 0, lodHidden = 0, lodGuard = 0;
 	double grassSeen = 0, grassNear = 0, grassCands = 0, grassCovered = 0, grassHidden = 0, grassGuard = 0;
 	double mbOutside = 0;   // land / LOD / grass nodes outside the view (left to the game's own test)
@@ -510,89 +528,57 @@ struct Stats {
 } gStats;
 static LARGE_INTEGER gQpcFreq;
 
-// Actors the main view does not draw: per actor ref, the newest main-view frame that reached it and the newest one that
-// hid it. The animation steps (AI threads, parallel tasks) read it, so it sits behind a lock. Developer builds also time
-// the engine's three per-actor steps, split into drawn / hidden by us / outside the main view.
-namespace AnimCost {
-	enum Step { kUpdate, kPose, kBones, kSteps };
-	enum Class { kDrawn, kHidden, kOutside, kClasses };
-	struct Sum { volatile LONG64 ticks[kClasses] = {}, calls[kClasses] = {}; };
-	static Sum gSum[kSteps];
-	static volatile LONG64 gSkipped[kClasses];                     // bone updates left for a later frame
-	static SRWLOCK gLock = SRWLOCK_INIT;
-	struct Seen { uint32_t seen = 0, hidden = 0; };
-	static std::unordered_map<void*, Seen> gActors;
-	static bool gHooked[kSteps];
+// What the main view did with each actor (keyed by its reference) and each object root (keyed by its BSFadeNode) in its
+// newest frames. The throttles read it from other threads (actor bones on the AI and parallel task threads, particles
+// after the frame), so each list sits behind a lock. gFrame and the camera position (gNowPos) are read there too,
+// without atomics: aligned 32-bit reads are whole on x86, and a value one frame old only moves a throttle decision by
+// a frame.
+enum SeenClass { kDrawn, kHidden, kOutside, kSeenClasses };
 
-	static void Mark(void* ref, uint32_t frame, bool hidden) {
-		AcquireSRWLockExclusive(&gLock);
-		Seen& s = gActors[ref];
-		s.seen = frame;
-		if (hidden) s.hidden = frame;
-		ReleaseSRWLockExclusive(&gLock);
+class SeenList {
+public:
+	// owner: what the key belongs to (an object root's reference), so an object loaded at a freed node's address does
+	// not inherit the old one's state.
+	void Mark(void* key, void* owner, uint32_t frame, bool hidden) {
+		AcquireSRWLockExclusive(&lock);
+		Entry& e = map[key];
+		if (e.owner != owner) { e.owner = owner; e.hidden = 0; }
+		e.seen = frame;
+		if (hidden) e.hidden = frame;
+		ReleaseSRWLockExclusive(&lock);
 	}
-	// Hidden: hidden by us in the newest main view (or the one being drawn). Outside: no main view reached it in the last
-	// two frames. Anything in between counts as drawn.
-	static Class Classify(void* ref, uint32_t now) {
-		AcquireSRWLockShared(&gLock);
-		auto it = gActors.find(ref);
-		Class c = kOutside;
-		if (it != gActors.end()) {
-			if (it->second.hidden + 1 >= now) c = kHidden;
+	// Hidden: hidden by us in the newest main view (or the one being drawn). Outside: no main view reached it in the
+	// last two frames. In between, or another owner than the one marked, counts as drawn.
+	SeenClass Classify(void* key, void* owner, uint32_t now) {
+		AcquireSRWLockShared(&lock);
+		auto it = map.find(key);
+		SeenClass c = kOutside;
+		if (it != map.end()) {
+			if (it->second.owner != owner) c = kDrawn;
+			else if (it->second.hidden + 1 >= now) c = kHidden;
 			else if (it->second.seen + 2 >= now) c = kDrawn;
 		}
-		ReleaseSRWLockShared(&gLock);
+		ReleaseSRWLockShared(&lock);
 		return c;
 	}
-	static void Prune(uint32_t now) {
-		AcquireSRWLockExclusive(&gLock);
-		for (auto it = gActors.begin(); it != gActors.end();)
-			it = it->second.seen + 600 < now ? gActors.erase(it) : std::next(it);
-		ReleaseSRWLockExclusive(&gLock);
+	// Drops what the main view has not reached for 600 frames.
+	void Prune(uint32_t now) {
+		AcquireSRWLockExclusive(&lock);
+		for (auto it = map.begin(); it != map.end();)
+			it = it->second.seen + 600 < now ? map.erase(it) : std::next(it);
+		ReleaseSRWLockExclusive(&lock);
 	}
-}
 
-namespace CellCost {
-	static volatile LONG64 gPhysTicks, gPhysCalls, gPhysInCellTicks, gCellTicks, gCellCalls;
-	static volatile LONG64 gObjTicks[AnimCost::kClasses], gObjCalls[AnimCost::kClasses];
-	static SRWLOCK gLock = SRWLOCK_INIT;
-	static std::unordered_map<void*, AnimCost::Seen> gNodes;      // BSFadeNode -> main-view frames
-	static thread_local int tInCell = 0, tInObject = 0;
-	enum Part { kLock, kGrid, kTasks, kDamage, kProjectiles, kParts };
-	static volatile LONG64 gPartTicks[kParts], gPartCalls[kParts];
-	static uintptr_t gPartOrig[kParts];
-	static bool gHooked = false;
+private:
+	struct Entry { uint32_t seen = 0, hidden = 0; void* owner = nullptr; };
+	SRWLOCK lock = SRWLOCK_INIT;
+	std::unordered_map<void*, Entry> map;
+};
+static SeenList gSeenActors, gSeenNodes;
+// Developer builds' log: bone and particle updates per log block, by what the main view did with their owner.
+static volatile LONG64 gBonesDone[kSeenClasses], gBonesSkipped[kSeenClasses];
+static volatile LONG64 gParticlesDone[kSeenClasses], gParticlesSkipped[kSeenClasses], gParticlesOther;
 
-	static void Mark(void* node, uint32_t frame, bool hidden) {
-		AcquireSRWLockExclusive(&gLock);
-		AnimCost::Seen& s = gNodes[node];
-		s.seen = frame;
-		if (hidden) s.hidden = frame;
-		ReleaseSRWLockExclusive(&gLock);
-	}
-	static AnimCost::Class Classify(void* node, uint32_t now) {
-		AcquireSRWLockShared(&gLock);
-		auto it = gNodes.find(node);
-		AnimCost::Class c = AnimCost::kOutside;
-		if (it != gNodes.end()) {
-			if (it->second.hidden + 1 >= now) c = AnimCost::kHidden;
-			else if (it->second.seen + 2 >= now) c = AnimCost::kDrawn;
-		}
-		ReleaseSRWLockShared(&gLock);
-		return c;
-	}
-	static void Prune(uint32_t now) {
-		AcquireSRWLockExclusive(&gLock);
-		for (auto it = gNodes.begin(); it != gNodes.end();)
-			it = it->second.seen + 600 < now ? gNodes.erase(it) : std::next(it);
-		ReleaseSRWLockExclusive(&gLock);
-	}
-	static LONG64 Ticks(const LARGE_INTEGER& a) {
-		LARGE_INTEGER b;
-		QueryPerformanceCounter(&b);
-		return b.QuadPart - a.QuadPart;
-	}
-}
 static bool gDepthGrows = true, gLoggedFirst = false;
 
 static double MicrosSince(const LARGE_INTEGER& start) {
@@ -882,8 +868,8 @@ static bool CollectMoving(void* node, void* ref, const float* bound, bool isActo
 	}
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { st.hidden += 1; st.hiddenGeoms += rec.geoms; }
-	if (isActor && hide && gCullingOn) AnimCost::Mark(ref, gFrame, true);
-	if (kDevTools && hide && gCullingOn) CellCost::Mark(node, gFrame, true);
+	if (isActor && hide && gCullingOn) gSeenActors.Mark(ref, ref, gFrame, true);
+	if (gSet.particleThrottle && hide && gCullingOn) gSeenNodes.Mark(node, ref, gFrame, true);
 	return hide;
 }
 
@@ -893,8 +879,8 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 		if (!gTreesOn) return false;
 	}
 	gStats.topFade += 1;
-	if (kDevTools) CellCost::Mark(node, gFrame, false);
 	void* ref = Game::At<void*>(node, Game::Fade_LinkedRef);
+	if (gSet.particleThrottle) gSeenNodes.Mark(node, ref, gFrame, false);   // reached by the main view (particles)
 	if (!ref) { gStats.noRef += 1; return false; }
 	const uint8_t refType = Game::At<uint8_t>(ref, Game::Form_Type);
 	void* base = Game::At<void*>(ref, Game::Ref_Base);
@@ -904,7 +890,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 
 	bool skip = true;
 	const bool isActorRef = (refType == Game::kCharacter || refType == Game::kCreature) && ref != *(void**)Game::PlayerPtr;
-	if (isActorRef) AnimCost::Mark(ref, gFrame, false);   // reached by the main view (CollectMoving marks the hidden ones)
+	if (isActorRef) gSeenActors.Mark(ref, ref, gFrame, false);   // reached by the main view (CollectMoving marks the hidden ones)
 	if (gActorsOn && (refType == Game::kCharacter || refType == Game::kCreature) && mult != Game::kLodBodyPart &&
 		ref != *(void**)Game::PlayerPtr && bound && bound[3] > 0.0f && bound[3] < 10000.0f &&
 		!(Game::At<uint32_t>(node, Game::Ni_Flags) & 1u)) {
@@ -977,7 +963,7 @@ static __declspec(noinline) bool Collect(void* node, bool tree) {
 	if (hide) { gStats.wouldHide += 1; gStats.hideGeoms += rec.geoms; }
 	gCandidates.push_back({ &rec, hide });
 	if (hide && gCullingOn) { gStats.hidden += 1; gStats.hiddenGeoms += rec.geoms; }
-	if (kDevTools && hide && gCullingOn) CellCost::Mark(node, gFrame, true);
+	if (gSet.particleThrottle && hide && gCullingOn) gSeenNodes.Mark(node, ref, gFrame, true);
 	if (mult == Game::kLodImposter) {
 		gStats.impCands += 1;
 		gStats.impGeoms += rec.geoms;
@@ -1009,29 +995,6 @@ static const char* RttiName(void* object) {
 	return r ? *(const char* const*)r : "?";
 }
 
-static std::unordered_map<std::string, double> gOtherMultiBounds;   // kind -> count (sampled every 8th frame)
-
-static void TallyMultiBound(void* node, void* shape) {
-	void* parent = Game::At<void*>(node, Game::Ni_Parent);
-	void* grand = parent ? Game::At<void*>(parent, Game::Ni_Parent) : nullptr;
-	const uint16_t n = Game::At<uint16_t>(node, Game::Node_ChildSize);
-	void* child = n ? *Game::At<void**>(node, Game::Node_ChildBase) : nullptr;
-	char key[200];
-	const char* own = NodeName(node);
-	const char* pn = NodeName(parent);
-	const char* gn = NodeName(grand);
-	const uintptr_t sv = shape ? *(uintptr_t*)shape : 0;
-	const char* st = sv == Game::Vtbl_MBAABB ? "AABB" : sv == 0x0101E9A4 ? "OBB" : sv == 0x0101EA8C ? "sphere" : shape ? "other" : "none";
-	char size[32] = "";
-	if (sv == Game::Vtbl_MBAABB) {
-		const float* h = &Game::At<float>(shape, Game::MBAABB_HalfExtents);
-		snprintf(size, sizeof size, " %.0fx%.0fx%.0f", 2 * h[0], 2 * h[1], 2 * h[2]);
-	}
-	snprintf(key, sizeof key, "'%s' in '%s' in '%s', %s%s, %u children, first %s", own ? own : "", pn ? pn : "", gn ? gn : "",
-		st, size, (unsigned)n, child ? RttiName(child) : "-");
-	gOtherMultiBounds[key] += 8.0;
-}
-
 enum BoxedKind { kBoxLand, kBoxLod, kBoxGrass };
 
 static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind kind) {
@@ -1040,14 +1003,13 @@ static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind k
 	else if (kind == kBoxLod) { st[0] = &gStats.lodNear; st[1] = &gStats.lodCands; st[2] = &gStats.lodCovered; st[3] = &gStats.lodHidden; st[4] = &gStats.lodGuard; }
 	else { st[0] = &gStats.grassNear; st[1] = &gStats.grassCands; st[2] = &gStats.grassCovered; st[3] = &gStats.grassHidden; st[4] = &gStats.grassGuard; }
 	Record& rec = gRecords[node];
-	if (rec.lastSeen == 0 || !rec.land || rec.pos[0] != c[0] || rec.pos[1] != c[1] || rec.pos[2] != c[2] || rec.scale != h[2] ||
-		rec.lmn[0] != h[0]) {
+	if (rec.lastSeen == 0 || !rec.land || rec.pos[0] != c[0] || rec.pos[1] != c[1] || rec.pos[2] != c[2] ||
+		rec.boxHalf[0] != h[0] || rec.boxHalf[1] != h[1] || rec.boxHalf[2] != h[2]) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = 0;
 		rec.pos[0] = c[0]; rec.pos[1] = c[1]; rec.pos[2] = c[2];
-		rec.scale = h[2];
-		rec.lmn[0] = h[0];   // unused for these boxes (not oriented): part of the identity
+		rec.boxHalf[0] = h[0]; rec.boxHalf[1] = h[1]; rec.boxHalf[2] = h[2];
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
 		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.actor = false; rec.door = false;
 		rec.land = true;
@@ -1082,13 +1044,12 @@ static bool ShapeInView(void* shape, void* culler) {
 	return (*(WithinFrustum_t**)shape)[Game::VSlot_MBShapeWithinFrustum](shape, (char*)culler + Game::Culler_Planes);
 }
 
-static bool CollectLand(void* node, void* culler) {
-	gStats.landSeen += 1;
+static bool CollectMultiBound(void* node, void* culler) {
+	gStats.multiBoundSeen += 1;
 	void* mb = Game::At<void*>(node, Game::MBNode_MultiBound);
 	void* shape = mb ? Game::At<void*>(mb, Game::MB_Shape) : nullptr;
 	const uint16_t children = Game::At<uint16_t>(node, Game::Node_ChildSize);
 	if (!shape || !children || *(uintptr_t*)shape != Game::Vtbl_MBAABB) {
-		if (kDevTools && gFrame % 8 == 0) TallyMultiBound(node, shape);
 		return false;
 	}
 	const float* c = &Game::At<float>(shape, Game::MBAABB_Center);
@@ -1120,13 +1081,12 @@ static bool CollectLand(void* node, void* culler) {
 		if (!ShapeInView(shape, culler)) { gStats.mbOutside += 1; return false; }
 		return CollectBoxed(node, c, h, kBoxLod);
 	}
-	if (kDevTools && gFrame % 8 == 0) TallyMultiBound(node, shape);
 	return false;
 }
 
-static bool SafeCollectLand(void* node, void* culler) {
-	__try { return CollectLand(node, culler); }
-	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting land"); return false; }
+static bool SafeCollectMultiBound(void* node, void* culler) {
+	__try { return CollectMultiBound(node, culler); }
+	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting land, terrain LOD or grass"); return false; }
 }
 
 static bool SafeCollect(void* node, bool tree) {
@@ -1253,8 +1213,9 @@ static MinimalStates gStates;
 
 // This frame's tests: boxes projected first (8 corners each), drawn after.
 // cls -1 = a lamp. A plain box is its 8 projected corners (expanded into 36 vertices when drawn); a clipped one is
-// its triangle list (count vertices).
-struct BatchItem { Record* rec; int8_t cls; bool clipped; uint32_t first, count; };
+// its triangle list (count vertices). A grown box has a second, grown copy right after the original (both are drawn:
+// growth alone can leave slivers of the original uncovered).
+struct BatchItem { Record* rec; int8_t cls; bool clipped, grown; uint32_t first, count; };
 static std::vector<BatchItem> gBatch;
 static std::vector<OcclusionMath::ScreenVertex> gBatchVerts;
 
@@ -1276,11 +1237,14 @@ static int DrawBatch(IDirect3DDevice9* device) {
 		if (!rec.query) rec.query = AcquireQuery(device);
 		if (!rec.query) break;
 		rec.query->Issue(D3DISSUE_BEGIN);
-		if (b.clipped) {
-			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, b.count / 3, &gBatchVerts[b.first], sizeof(OcclusionMath::ScreenVertex));
-		} else {
-			OcclusionMath::ExpandBox(&gBatchVerts[b.first], tri);
-			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, tri, sizeof(OcclusionMath::ScreenVertex));
+		for (uint32_t copy = 0; copy < (b.grown ? 2u : 1u); ++copy) {
+			const uint32_t first = b.first + copy * b.count;
+			if (b.clipped) {
+				device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, b.count / 3, &gBatchVerts[first], sizeof(OcclusionMath::ScreenVertex));
+			} else {
+				OcclusionMath::ExpandBox(&gBatchVerts[first], tri);
+				device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, tri, sizeof(OcclusionMath::ScreenVertex));
+			}
 		}
 		rec.query->Issue(D3DISSUE_END);
 		rec.pending = true;
@@ -1437,27 +1401,22 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		// ProjectCornersClipped); a box with nothing in front of the camera is not tested.
 		auto add = [&](Record& rec, const float (*corners)[3], int8_t cls) {
 			const size_t at = gBatchVerts.size();
-			const bool plain = OcclusionMath::CornersUnclipped(corners, posAdjust, &view._11, &proj._11);
-			uint32_t count = 8;
-			if (plain) {
-				gBatchVerts.resize(at + 8);
-				OcclusionMath::ProjectCornerPoints(corners, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
-					(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at]);
-			} else {
-				gBatchVerts.resize(at + OcclusionMath::kMaxClippedVertices);
-				count = (uint32_t)OcclusionMath::ProjectCornersClipped(corners, posAdjust, &view._11, &proj._11, (float)vp.X,
-					(float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at]);
-				gBatchVerts.resize(at + count);
-				if (!count) return false;
-				gStats.clippedBoxes += 1;
-			}
+			gBatchVerts.resize(at + OcclusionMath::kMaxClippedVertices);
+			bool plain = true;
+			const uint32_t count = (uint32_t)OcclusionMath::ProjectBoxForTest(corners, posAdjust, &view._11, &proj._11,
+				(float)vp.X, (float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at], plain);
+			gBatchVerts.resize(at + count);
+			if (!count) return false;
+			if (!plain) gStats.clippedBoxes += 1;
 			rec.issuedGrown = grow > 0.0f && rec.answered && (rec.zeroStreak > 0 || rec.afterGrown);
-			if (rec.issuedGrown) {
-				if (plain) OcclusionMath::GrowOnScreen(&gBatchVerts[at], grow);
-				else OcclusionMath::GrowOnScreenN(&gBatchVerts[at], (int)count, grow);
+			if (rec.issuedGrown) {   // a grown copy after the original; both are drawn
+				gBatchVerts.resize(at + 2 * count);
+				std::copy(gBatchVerts.begin() + at, gBatchVerts.begin() + at + count, gBatchVerts.begin() + at + count);
+				if (plain) OcclusionMath::GrowOnScreen(&gBatchVerts[at + count], grow);
+				else OcclusionMath::GrowOnScreenN(&gBatchVerts[at + count], (int)count, grow);
 				gStats.revealGrown += 1;
 			}
-			gBatch.push_back({ &rec, cls, !plain, (uint32_t)at, count });
+			gBatch.push_back({ &rec, cls, !plain, rec.issuedGrown, (uint32_t)at, count });
 			return true;
 		};
 		for (Lamp* lamp : gLampCandidates) {
@@ -1577,7 +1536,7 @@ static void LogBlock() {
 	logMoving("actors", gActorsOn, gStats.actor);
 	logMoving("doors, activators, terminals", gActivatorsOn, gStats.door);
 	Log("  land (%s): %.1f multibound nodes per frame drawn by the main view, %.1f land quadrants, %.1f near the camera, %.1f "
-		"tested | covered %.1f: hidden %.1f, camera guard / answer too old %.1f", gLandOn ? "on" : "off", gStats.landSeen / f,
+		"tested | covered %.1f: hidden %.1f, camera guard / answer too old %.1f", gLandOn ? "on" : "off", gStats.multiBoundSeen / f,
 		gStats.landQuads / f, gStats.landNear / f, gStats.landCands / f, gStats.landCovered / f, gStats.landHidden / f,
 		gStats.landGuard / f);
 	Log("  distant terrain LOD (%s): %.1f chunks per frame drawn by the main view, %.1f near the camera, %.1f tested | covered "
@@ -1587,55 +1546,22 @@ static void LogBlock() {
 		"%.1f, camera guard / answer too old %.1f | land, LOD and grass nodes outside the view %.1f", gGrassOn ? "on" : "off",
 		gStats.grassSeen / f, gStats.grassNear / f, gStats.grassCands / f, gStats.grassCovered / f, gStats.grassHidden / f,
 		gStats.grassGuard / f, gStats.mbOutside / f);
-	if (!gOtherMultiBounds.empty()) {
-		std::vector<std::pair<double, std::string>> kinds;
-		for (auto& k : gOtherMultiBounds) kinds.push_back({ k.second, k.first });
-		std::sort(kinds.begin(), kinds.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
-		Log("  other multibound nodes, left alone (per frame, sampled every 8th frame; %u kinds):", (unsigned)kinds.size());
-		for (size_t i = 0; i < kinds.size() && i < 12; ++i) Log("    %.1f  %s", kinds[i].first / f, kinds[i].second.c_str());
-		gOtherMultiBounds.clear();
-	}
 	{
-		using namespace AnimCost;
-		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
-		auto step = [&](Step s) {
-			static char text[kSteps][200];
-			const Sum& m = gSum[s];
-			if (!gHooked[s]) { snprintf(text[s], sizeof text[s], "not hooked"); return (const char*)text[s]; }
-			snprintf(text[s], sizeof text[s], "%.0f / %.0f / %.0f us (%.1f / %.1f / %.1f actors)", m.ticks[kDrawn] * us,
-				m.ticks[kHidden] * us, m.ticks[kOutside] * us, m.calls[kDrawn] / f, m.calls[kHidden] / f, m.calls[kOutside] / f);
-			return (const char*)text[s];
-		};
-		Log("  actor animation, CPU per frame summed over all threads (not the player), drawn / hidden by us / outside the "
-			"main view: sequences + pose (AI thread) %s | movement + other controllers (parallel tasks) %s | bone transforms "
-			"(after the AI join) %s", step(kUpdate), step(kPose), step(kBones));
-		Log("  actor bones (%s, every %d frames beyond %.0f units): left for a later frame %.1f hidden + %.1f outside the view "
-			"per frame", gAnimThrottleOn && gSet.animInterval > 1 ? "throttled" : "every frame", gSet.animInterval,
-			gSet.animNearDistance, gSkipped[kHidden] / f, gSkipped[kOutside] / f);
-		for (volatile LONG64& k : gSkipped) InterlockedExchange64(&k, 0);
-		for (Sum& m : gSum)
-			for (int h = 0; h < kClasses; ++h) { InterlockedExchange64(&m.ticks[h], 0); InterlockedExchange64(&m.calls[h], 0); }
-		Prune(gFrame);
-	}
-	if (CellCost::gHooked) {
-		using namespace CellCost;
-		using AnimCost::kDrawn; using AnimCost::kHidden; using AnimCost::kOutside;
-		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
-		const double objUs = (gObjTicks[kDrawn] + gObjTicks[kHidden] + gObjTicks[kOutside]) * us;
-		Log("  cell update (AI thread, per frame): Havok step %.0f us (%.1f world steps) | cell updates %.0f us (%.1f cells) = "
-			"interior Havok %.0f + animated objects %.0f + rest %.0f us | animated objects drawn / hidden by us / outside the "
-			"main view: %.0f / %.0f / %.0f us (%.1f / %.1f / %.1f objects)", gPhysTicks * us, gPhysCalls / f, gCellTicks * us,
-			gCellCalls / f, gPhysInCellTicks * us, objUs, gCellTicks * us - gPhysInCellTicks * us - objUs,
-			gObjTicks[kDrawn] * us, gObjTicks[kHidden] * us, gObjTicks[kOutside] * us, gObjCalls[kDrawn] / f,
-			gObjCalls[kHidden] / f, gObjCalls[kOutside] / f);
-		for (volatile LONG64* k : { &gPhysTicks, &gPhysCalls, &gPhysInCellTicks, &gCellTicks, &gCellCalls }) InterlockedExchange64(k, 0);
-		for (int c = 0; c < AnimCost::kClasses; ++c) { InterlockedExchange64(&gObjTicks[c], 0); InterlockedExchange64(&gObjCalls[c], 0); }
-		auto part = [&](Part p) { return gPartOrig[p] ? gPartTicks[p] * us : -1.0; };
-		Log("  cell update parts (AI thread, per frame; -1 = not hooked): Havok lock wait %.0f us | exterior cells incl. Havok step "
-			"%.0f us | queued parallel tasks %.0f us | collision damage %.0f us | projectiles %.0f us", part(kLock), part(kGrid),
-			part(kTasks), part(kDamage), part(kProjectiles));
-		for (int p = 0; p < kParts; ++p) { InterlockedExchange64(&gPartTicks[p], 0); InterlockedExchange64(&gPartCalls[p], 0); }
-		Prune(gFrame);
+		auto per = [&](volatile LONG64* v, int i) { return (double)v[i] / f; };
+		Log("  actor bones (%s, every %d frames beyond %.0f units), per frame: updated %.1f drawn / %.1f hidden / %.1f outside "
+			"the view, left for later %.1f hidden + %.1f outside", gAnimThrottleOn && gSet.animInterval > 1 ? "throttled" :
+			"every frame", gSet.animInterval, gSet.animNearDistance, per(gBonesDone, kDrawn), per(gBonesDone, kHidden),
+			per(gBonesDone, kOutside), per(gBonesSkipped, kHidden), per(gBonesSkipped, kOutside));
+		Log("  particles (%s, every %d frames beyond %.0f units), per frame: updated %.1f drawn / %.1f hidden / %.1f outside "
+			"the view, left for later %.1f hidden + %.1f outside | other queued nodes (cell dynamic nodes) %.1f",
+			gParticleThrottleOn && gSet.particleInterval > 1 ? "throttled" : "every frame", gSet.particleInterval,
+			gSet.particleNearDistance, per(gParticlesDone, kDrawn), per(gParticlesDone, kHidden), per(gParticlesDone, kOutside),
+			per(gParticlesSkipped, kHidden), per(gParticlesSkipped, kOutside), (double)gParticlesOther / f);
+		for (int c = 0; c < kSeenClasses; ++c) {
+			InterlockedExchange64(&gBonesDone[c], 0); InterlockedExchange64(&gBonesSkipped[c], 0);
+			InterlockedExchange64(&gParticlesDone[c], 0); InterlockedExchange64(&gParticlesSkipped[c], 0);
+		}
+		InterlockedExchange64(&gParticlesOther, 0);
 	}
 	Log("  trees (SpeedTree, tree culling %s): %.1f per frame drawn by the main view, %.1f tested (%.0f shapes), %.1f hidden "
 		"(%.0f shapes); counted with the objects above and below", gTreesOn ? "on" : "off", gStats.treeSeen / f, gStats.treeCands / f,
@@ -1835,8 +1761,8 @@ static void __fastcall TreeOnVisibleHook(void* node, void*, void* culler) {
 
 static void __fastcall MultiBoundOnVisibleHook(void* node, void*, void* culler) {
 	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread && gFadeDepth == 0 &&
-		SafeCollectLand(node, culler) && gCullingOn && !gFaulted)
-		return;   // proven covered: the quadrant's land is not drawn
+		SafeCollectMultiBound(node, culler) && gCullingOn && !gFaulted)
+		return;   // proven covered: the land square, terrain chunk or grass group is not drawn
 	OrigMultiBoundOnVisible(node, culler);
 }
 
@@ -1880,6 +1806,7 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 		gLandOn = gSet.landCulling != (gCompareMode == 1);
 		gGrassOn = gSet.grassCulling != (gCompareMode == 2);
 		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 3);
+		gParticleThrottleOn = gSet.particleThrottle != (gCompareMode == 3);
 		gCompareMessage = true;
 		Log("[frame %u] compare key: land %s, grass %s, actor bone throttle %s", gFrame, gLandOn ? "ON" : "OFF",
 			gGrassOn ? "ON" : "OFF", gAnimThrottleOn ? "ON" : "OFF");
@@ -1894,6 +1821,7 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	for (int i = 0; i < 3; ++i) gCamPos[slot][i] = gNowPos[i];
 	for (int i = 0; i < 9; ++i) gCamRot[slot][i] = gNowRot[i];
 	++gFrame;
+	if (gFrame % 600 == 0) { gSeenActors.Prune(gFrame); gSeenNodes.Prune(gFrame); }
 	gStats.frames += 1;
 	if (gStats.frames >= gSet.logInterval) {
 		if (kDevTools) LogBlock();
@@ -1902,9 +1830,11 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[4] = { "as set in the INI", "land switched", "grass switched", "bone throttle switched" };
+		static const char* const kWhat[4] = { "as set in the INI", "land switched", "grass switched", "throttles switched" };
 		snprintf(message, sizeof(message), "Occlusion culling (%s): land %s, grass %s, bones %s", kWhat[gCompareMode],
 			gLandOn ? "ON" : "OFF", gGrassOn ? "ON" : "OFF", gAnimThrottleOn ? "throttled" : "every frame");
+		if (gParticleThrottleOn != gAnimThrottleOn) snprintf(message + strlen(message), sizeof(message) - strlen(message),
+			", particles %s", gParticleThrottleOn ? "throttled" : "every frame");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1915,200 +1845,90 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Cell update timing (developer builds, measuring only): the AI thread's TES::UpdateCellAnimations runs the Havok
-// step (bhkWorld::Update) and each loaded cell's TESObjectCELL::UpdateManagedNodes, which updates every animated
-// reference's scene graph (signs, fans, doors...; trees only inside the view). Animated objects are split like
-// actors: drawn / hidden by us / not reached by the main view in the last two frames.
+// Throttles: actor bones ([Actors] bAnimThrottle) and particles ([Particles] bParticleThrottle). What the main view did
+// not draw (hidden by us, or not reached in the last two frames) and is not near the camera is brought up to date only
+// every iAnimInterval / iParticleInterval frames, each owner on its own turn (its address picks the frame).
 
-typedef uintptr_t(__thiscall* bhkWorldUpdate_t)(void*);
-typedef void(__thiscall* CellUpdateManaged_t)(void*, float, bool);
-typedef void(__thiscall* FadeUpdateSelected_t)(void*, void*, uint32_t);
-
-static uintptr_t __fastcall bhkWorldUpdateHook(void* world, void*) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	const uintptr_t result = ((bhkWorldUpdate_t)Game::Fn_bhkWorldUpdate)(world);
-	const LONG64 t = CellCost::Ticks(a);
-	InterlockedAdd64(&CellCost::gPhysTicks, t);
-	InterlockedIncrement64(&CellCost::gPhysCalls);
-	if (CellCost::tInCell) InterlockedAdd64(&CellCost::gPhysInCellTicks, t);   // an interior's step, inside its cell update
-	return result;
+static bool FartherThan(const float* p, float distance) {
+	const float dx = p[0] - gNowPos[0], dy = p[1] - gNowPos[1], dz = p[2] - gNowPos[2];
+	return dx * dx + dy * dy + dz * dz >= distance * distance;
 }
 
-static void __fastcall CellUpdateManagedHook(void* cell, void*, float time, bool largeOnly) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	++CellCost::tInCell;
-	((CellUpdateManaged_t)Game::Fn_CellUpdateManagedNodes)(cell, time, largeOnly);
-	--CellCost::tInCell;
-	InterlockedAdd64(&CellCost::gCellTicks, CellCost::Ticks(a));
-	InterlockedIncrement64(&CellCost::gCellCalls);
+static bool NotItsTurn(const void* owner, uint32_t now, int interval) {
+	return (now + (uint32_t)((uintptr_t)owner >> 4)) % (uint32_t)interval != 0;
 }
 
-// Only the outermost fade node inside a cell update is timed (the animated reference's root; dropped items under the
-// cell's dynamic node count too).
-static void __fastcall FadeUpdateSelectedHook(void* node, void*, void* data, uint32_t flags) {
-	if (!CellCost::tInCell || CellCost::tInObject) {
-		((FadeUpdateSelected_t)Game::Fn_FadeUpdateSelected)(node, data, flags);
-		return;
-	}
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	++CellCost::tInObject;
-	((FadeUpdateSelected_t)Game::Fn_FadeUpdateSelected)(node, data, flags);
-	--CellCost::tInObject;
-	const LONG64 t = CellCost::Ticks(a);
-	const int c = CellCost::Classify(node, gFrame);
-	InterlockedAdd64(&CellCost::gObjTicks[c], t);
-	InterlockedIncrement64(&CellCost::gObjCalls[c]);
-}
-
-typedef void(__thiscall* LockHavok_t)(void*, int);
-typedef void(__thiscall* GridUpdate_t)(void*, float);
-typedef void(__thiscall* NoArgs_t)(void*);
-
-static void AddPart(CellCost::Part part, const LARGE_INTEGER& a) {
-	InterlockedAdd64(&CellCost::gPartTicks[part], CellCost::Ticks(a));
-	InterlockedIncrement64(&CellCost::gPartCalls[part]);
-}
-static void __fastcall LockHavokHook(void* tes, void*, int lock) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	((LockHavok_t)CellCost::gPartOrig[CellCost::kLock])(tes, lock);
-	AddPart(CellCost::kLock, a);
-}
-static void __fastcall GridUpdateHook(void* grid, void*, float time) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	((GridUpdate_t)CellCost::gPartOrig[CellCost::kGrid])(grid, time);
-	AddPart(CellCost::kGrid, a);
-}
-template <CellCost::Part kPart> static void __fastcall NoArgsHook(void* self, void*) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	((NoArgs_t)CellCost::gPartOrig[kPart])(self);
-	AddPart(kPart, a);
-}
-
-// Only slots and calls that still point at the game's own function are taken.
-static void InstallCellTiming() {
-	struct { uintptr_t at, target; CellCost::Part part; void* hook; } parts[] = {
-		{ Game::Call_LockHavok, 0x00453860, CellCost::kLock, &LockHavokHook },
-		{ Game::Call_GridUpdate, 0x004BA9A0, CellCost::kGrid, &GridUpdateHook },
-		{ Game::Call_ParallelTasks, 0x0087AA90, CellCost::kTasks, &NoArgsHook<CellCost::kTasks> },
-		{ Game::Call_ObjectDamage, 0x00623640, CellCost::kDamage, &NoArgsHook<CellCost::kDamage> },
-		{ Game::Call_Projectiles, 0x00975080, CellCost::kProjectiles, &NoArgsHook<CellCost::kProjectiles> },
-	};
-	int taken = 0;
-	for (auto& p : parts)
-		if (*(uint8_t*)p.at == 0xE8 && p.at + 5 + *(int32_t*)(p.at + 1) == p.target) {
-			CellCost::gPartOrig[p.part] = ReplaceCall(p.at, p.hook);
-			++taken;
-		}
-	Log("Cell update parts timing: %d of 5 calls", taken);
-	int cells = 0;
-	for (uintptr_t at : Game::Call_CellUpdateManagedNodes)
-		if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_CellUpdateManagedNodes) {
-			ReplaceCall(at, &CellUpdateManagedHook);
-			++cells;
-		}
-	const bool physics = *(uintptr_t*)Game::Vtbl_bhkWorldUpdate == Game::Fn_bhkWorldUpdate;
-	if (physics) ReplaceVirtual(Game::Vtbl_bhkWorldUpdate, &bhkWorldUpdateHook);
-	const bool objects = *(uintptr_t*)Game::Vtbl_FadeUpdateSelected == Game::Fn_FadeUpdateSelected;
-	if (objects) ReplaceVirtual(Game::Vtbl_FadeUpdateSelected, &FadeUpdateSelectedHook);
-	CellCost::gHooked = cells > 0;
-	Log("Cell update timing: %d of 2 cell update calls, Havok step %s, animated objects %s", cells, physics ? "hooked" : "NOT hooked",
-		objects ? "hooked" : "NOT hooked");
-}
-
-// ---------------------------------------------------------------------------------------------------------------
-// Actor animation timing (developer builds)
-
-typedef void(__thiscall* ActorUpdateAnim_t)(void*, float);
-typedef void(__thiscall* ActorAnimMove_t)(void*);
 typedef char(__thiscall* QueuedScenegraph_t)(void*);
-
 typedef void(__thiscall* SetDelayUpdateScenegraph_t)(void*, bool);
 
-static void AddAnimCost(AnimCost::Step step, void* actor, const LARGE_INTEGER& a) {
-	LARGE_INTEGER b;
-	QueryPerformanceCounter(&b);
-	if (!actor || actor == *(void**)Game::PlayerPtr) return;
-	const int c = AnimCost::Classify(actor, gFrame);
-	InterlockedAdd64(&AnimCost::gSum[step].ticks[c], b.QuadPart - a.QuadPart);
-	InterlockedIncrement64(&AnimCost::gSum[step].calls[c]);
-}
-
-// Bone transforms of an actor the main view does not draw (hidden by us, or outside the view in the last two frames)
-// and that is not near the camera are brought up to date only every iAnimInterval frames. The skipped ones get the
-// engine's "update queued" flag cleared, as a done update would, so the next frame queues them again normally.
-static bool SkipBones(void* animation) {
-	if (!gAnimThrottleOn || !gCullingOn || gSet.animInterval <= 1 || gFaulted) return false;
-	void* actor = Game::At<void*>(animation, Game::Anim_Actor);
-	if (!actor || actor == *(void**)Game::PlayerPtr) return false;
-	const uint32_t now = gFrame;
-	if ((now + (uint32_t)((uintptr_t)actor >> 4)) % (uint32_t)gSet.animInterval == 0) return false;   // its turn
-	const AnimCost::Class c = AnimCost::Classify(actor, now);
-	if (c == AnimCost::kDrawn) return false;
-	const float* p = &Game::At<float>(actor, Game::Ref_Position);
-	const float dx = p[0] - gNowPos[0], dy = p[1] - gNowPos[1], dz = p[2] - gNowPos[2];
-	if (dx * dx + dy * dy + dz * dz < gSet.animNearDistance * gSet.animNearDistance) return false;
-	if (kDevTools) InterlockedIncrement64(&AnimCost::gSkipped[c]);
-	return true;
-}
-
-static void __fastcall ActorUpdateAnimationHook(void* actor, void*, float time) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	((ActorUpdateAnim_t)Game::Fn_ActorUpdateAnimation)(actor, time);
-	AddAnimCost(AnimCost::kUpdate, actor, a);
-}
-
-static void __fastcall ActorUpdateAnimMovementHook(void* actor, void*) {
-	LARGE_INTEGER a;
-	QueryPerformanceCounter(&a);
-	((ActorAnimMove_t)Game::Fn_ActorUpdateAnimMovement)(actor);
-	AddAnimCost(AnimCost::kPose, actor, a);
-}
-
+// A skipped actor gets the engine's "update queued" flag cleared, as a done update would, so the next frame queues it
+// again normally. Animations, AI and movement still run every frame; only the bone positions wait.
 static char __fastcall QueuedScenegraphHook(void* animation, void*) {
-	if (SkipBones(animation)) {
+	void* actor = Game::At<void*>(animation, Game::Anim_Actor);
+	const bool throttle = gAnimThrottleOn && gCullingOn && !gFaulted && gSet.animInterval > 1;
+	if (!actor || actor == *(void**)Game::PlayerPtr || !(throttle || kDevTools))
+		return ((QueuedScenegraph_t)Game::Fn_QueuedScenegraph)(animation);
+	const uint32_t now = gFrame;
+	const SeenClass c = gSeenActors.Classify(actor, actor, now);
+	if (throttle && c != kDrawn && NotItsTurn(actor, now, gSet.animInterval) &&
+		FartherThan(&Game::At<float>(actor, Game::Ref_Position), gSet.animNearDistance)) {
+		if (kDevTools) InterlockedIncrement64(&gBonesSkipped[c]);
 		((SetDelayUpdateScenegraph_t)Game::Fn_SetDelayUpdateScenegraph)(animation, false);
 		return 0;
 	}
-	LARGE_INTEGER a = {};
-	if (kDevTools) QueryPerformanceCounter(&a);
 	const char updated = ((QueuedScenegraph_t)Game::Fn_QueuedScenegraph)(animation);
-	if (kDevTools && updated) AddAnimCost(AnimCost::kBones, Game::At<void*>(animation, Game::Anim_Actor), a);
+	if (kDevTools && updated) InterlockedIncrement64(&gBonesDone[c]);
 	return updated;
 }
 
-// Only slots and calls that still point at the game's own function are taken (another plugin's hook is left alone).
-static void InstallAnimHooks() {
-	int updates = 0, moves = 0, bones = 0;
-	if (!kDevTools && !(gSet.animThrottle && gSet.animInterval > 1)) return;
-	if (*(uint8_t*)(Game::Fn_SetDelayUpdateScenegraph) != 0x55) {   // push ebp: the function is where it should be
-		Log("Actor bones: 0x%08X is not Animation::SetDelayUpdateScenegraph; actor animation left alone",
-			(unsigned)Game::Fn_SetDelayUpdateScenegraph);
+typedef void(__cdecl* ParticlesOnly_t)(void*);
+
+// Only object roots (BSFadeNode) are throttled; particle systems run on the time they are given, so a skipped frame
+// is caught up at the next step. Other queued nodes (the cell's dynamic node with projectiles and dropped things)
+// always update.
+static void __cdecl ParticlesOnlyHook(void* node) {
+	if (!node || *(uintptr_t*)node != Game::Vtbl_BSFadeNode) {
+		if (kDevTools) InterlockedIncrement64(&gParticlesOther);
+		((ParticlesOnly_t)Game::Fn_ParticlesOnly)(node);
 		return;
 	}
-	for (uintptr_t slot : Game::Vtbl_ActorUpdateAnimation)
-		if (kDevTools && *(uintptr_t*)slot == Game::Fn_ActorUpdateAnimation) { ReplaceVirtual(slot, &ActorUpdateAnimationHook); ++updates; }
-	for (uintptr_t slot : Game::Vtbl_ActorUpdateAnimMovement)
-		if (kDevTools && *(uintptr_t*)slot == Game::Fn_ActorUpdateAnimMovement) {
-			ReplaceVirtual(slot, &ActorUpdateAnimMovementHook);
-			++moves;
+	const uint32_t now = gFrame;
+	const SeenClass c = gSeenNodes.Classify(node, Game::At<void*>(node, Game::Fade_LinkedRef), now);
+	if (gParticleThrottleOn && gCullingOn && !gFaulted && gSet.particleInterval > 1 && c != kDrawn &&
+		NotItsTurn(node, now, gSet.particleInterval) &&
+		FartherThan(&Game::At<float>(node, Game::Ni_WorldTranslate), gSet.particleNearDistance)) {
+		if (kDevTools) InterlockedIncrement64(&gParticlesSkipped[c]);
+		return;
+	}
+	((ParticlesOnly_t)Game::Fn_ParticlesOnly)(node);
+	if (kDevTools) InterlockedIncrement64(&gParticlesDone[c]);
+}
+
+// Only calls that still point at the game's own function are taken (another plugin's hook is left alone).
+static void InstallThrottleHooks() {
+	if (kDevTools || (gSet.animThrottle && gSet.animInterval > 1)) {
+		if (*(uint8_t*)(Game::Fn_SetDelayUpdateScenegraph) != 0x55) {   // push ebp: the function is where it should be
+			Log("Actor bones: 0x%08X is not Animation::SetDelayUpdateScenegraph; actor bones left alone",
+				(unsigned)Game::Fn_SetDelayUpdateScenegraph);
+		} else {
+			int bones = 0;
+			for (uintptr_t at : Game::Call_QueuedScenegraph)
+				if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_QueuedScenegraph) {
+					ReplaceCall(at, &QueuedScenegraphHook);
+					++bones;
+				}
+			Log("Actor bone hook: %d of 3 bone transform calls", bones);
 		}
-	for (uintptr_t at : Game::Call_QueuedScenegraph)
-		if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_QueuedScenegraph) {
-			ReplaceCall(at, &QueuedScenegraphHook);
-			++bones;
+	}
+	if (kDevTools || (gSet.particleThrottle && gSet.particleInterval > 1)) {
+		const uintptr_t at = Game::Call_ParticlesOnly;
+		if (*(uint8_t*)at == 0xE8 && at + 5 + *(int32_t*)(at + 1) == Game::Fn_ParticlesOnly) {
+			ReplaceCall(at, &ParticlesOnlyHook);
+			Log("Particle hook installed: RunQueuedParticleUpdates -> UpdateParticlesOnly");
+		} else {
+			Log("Particles: 0x%08X is not the game's UpdateParticlesOnly call (another plugin?); particles left alone", (unsigned)at);
 		}
-	AnimCost::gHooked[AnimCost::kUpdate] = updates > 0;
-	AnimCost::gHooked[AnimCost::kPose] = moves > 0;
-	AnimCost::gHooked[AnimCost::kBones] = bones > 0;
-	Log("Actor animation hooks: %d of 4 UpdateAnimation slots, %d of 4 UpdateAnimMovement slots (timing, developer builds), %d "
-		"of 3 bone transform calls", updates, moves, bones);
+	}
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -2137,8 +1957,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	Log("Tree hook installed: BSTreeNode::OnVisible -> 0x%08X%s", (unsigned)(uintptr_t)OrigTreeOnVisible,
 		(uintptr_t)OrigTreeOnVisible != 0x0066BF50 ? " (through another plugin's hook)" : "");
 	OrigLampTest = (LampTest_t)ReplaceCall(Game::Call_LampTest, &LampTestHook);
-	InstallAnimHooks();
-	if (kDevTools) InstallCellTiming();
+	InstallThrottleHooks();
 	Log(OrigLampTest ? "Lamp test hook installed -> 0x%08X%s" : "0x%08X: the lamp test call is not a call; lamps are left alone%s",
 		OrigLampTest ? (unsigned)(uintptr_t)OrigLampTest : (unsigned)Game::Call_LampTest,
 		OrigLampTest && (uintptr_t)OrigLampTest != 0x00B9E970 ? " (through another plugin's hook, e.g. NVR's KeepLampsInView)" : "");
@@ -2151,6 +1970,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gActivatorsOn = gSet.activatorCulling;
 	gRevealOn = gSet.revealDepth > 0.0f;
 	gAnimThrottleOn = gSet.animThrottle;
+	gParticleThrottleOn = gSet.particleThrottle;
 	gLandOn = gSet.landCulling;
 	gGrassOn = gSet.grassCulling;
 	if (kDevTools)

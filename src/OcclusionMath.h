@@ -125,7 +125,8 @@ namespace OcclusionMath {
 	}
 
 	// Grows a projected box on screen: each corner moves `px` pixels away from the corners' centre along x and y, so
-	// the box covers at least `px` more on every side of its screen rectangle. Depths are kept.
+	// the box's screen rectangle grows by `px` on every side. Depths are kept. The moved corners' triangles need not
+	// cover all of the original outline (math_test finds slivers), so a grown box is drawn together with its original.
 	inline void GrowOnScreen(ScreenVertex* s8, float px) {
 		float cx = 0.0f, cy = 0.0f;
 		for (int k = 0; k < 8; ++k) { cx += s8[k].x; cy += s8[k].y; }
@@ -183,10 +184,8 @@ namespace OcclusionMath {
 	// cover no pixel. Depth is clamped into [minZ, maxZ]: points closer than the near plane count as the nearest depth,
 	// which can only make the box easier to see. Returns the triangle-list vertex count (at most kMaxClippedVertices);
 	// 0 = no part of the box is in front of the camera.
-	inline int ProjectCornersClipped(const float (*corners)[3], const float* origin, const float* view, const float* proj,
-		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out, float wMin = 1.0f) {
-		float c[8][4];
-		ClipCorners(corners, origin, view, proj, c);
+	inline int ClipAndProject(const float (*c)[4], float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ,
+		uint32_t color, ScreenVertex* out, float wMin) {
 		const float lo = minZ < maxZ ? minZ : maxZ, hi = minZ < maxZ ? maxZ : minZ;
 		int n = 0;
 		for (const int* face : kBoxFaces) {
@@ -227,6 +226,33 @@ namespace OcclusionMath {
 		return n;
 	}
 
+	inline int ProjectCornersClipped(const float (*corners)[3], const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out, float wMin = 1.0f) {
+		float c[8][4];
+		ClipCorners(corners, origin, view, proj, c);
+		return ClipAndProject(c, vpX, vpY, vpW, vpH, minZ, maxZ, color, out, wMin);
+	}
+
+	// A box's test vertices in one pass over its corners' clip coordinates: the 8 projected corners when nothing needs
+	// cutting (plain = true; drawn as kBoxIndices triangles, the same values ProjectCornerPoints gives), else the clipped
+	// triangle list. Returns the vertex count (8, the clipped count, or 0 = no part in front of the camera).
+	inline int ProjectBoxForTest(const float (*corners)[3], const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out, bool& plain,
+		float wMin = 1.0f) {
+		float c[8][4];
+		ClipCorners(corners, origin, view, proj, c);
+		plain = true;
+		for (int k = 0; k < 8 && plain; ++k)
+			for (int i = 0; i < 5 && plain; ++i) plain = ClipPlane(c[k], i, wMin) >= 0.0f;
+		if (!plain) return ClipAndProject(c, vpX, vpY, vpW, vpH, minZ, maxZ, color, out, wMin);
+		for (int k = 0; k < 8; ++k) {
+			const float iw = 1.0f / c[k][3];
+			out[k] = { vpX + (c[k][0] * iw * 0.5f + 0.5f) * vpW - 0.5f, vpY + (0.5f - c[k][1] * iw * 0.5f) * vpH - 0.5f,
+			           minZ + c[k][2] * iw * (maxZ - minZ), iw, color };
+		}
+		return 8;
+	}
+
 	// Whether every corner lies inside the planes ProjectCornersClipped cuts at (then the plain 8-corner path is exact).
 	inline bool CornersUnclipped(const float (*corners)[3], const float* origin, const float* view, const float* proj, float wMin = 1.0f) {
 		float c[8][4];
@@ -238,7 +264,8 @@ namespace OcclusionMath {
 	}
 
 	// GrowOnScreen for any number of vertices (a clipped box's triangle list): each moves `px` pixels away from their
-	// centre along x and y.
+	// centre along x and y. Like GrowOnScreen, this can leave a sliver of the original outline uncovered, so a grown box
+	// is always drawn together with its original triangles (RunQueries).
 	inline void GrowOnScreenN(ScreenVertex* s, int count, float px) {
 		if (count <= 0) return;
 		float cx = 0.0f, cy = 0.0f;

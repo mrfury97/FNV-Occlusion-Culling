@@ -294,6 +294,86 @@ int main() {
 		}
 	}
 
+	// ProjectBoxForTest: the same vertices as the two separate paths.
+	{
+		float ahead[8][3], straddle[8][3];
+		OcclusionMath::AxisCorners(mn, mx, ahead);
+		const float smn[3] = { cam[0] - 2000, cam[1] - 1000, cam[2] - 200 }, smx[3] = { cam[0] + 2000, cam[1] + 3000, cam[2] + 300 };
+		OcclusionMath::AxisCorners(smn, smx, straddle);
+		OcclusionMath::ScreenVertex a[OcclusionMath::kMaxClippedVertices], b[OcclusionMath::kMaxClippedVertices];
+		bool plain = false;
+		int n = OcclusionMath::ProjectBoxForTest(ahead, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, a, plain);
+		OcclusionMath::ProjectCornerPoints(ahead, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, b);
+		bool same = n == 8 && plain;
+		for (int k = 0; k < 8 && same; ++k) same = a[k].x == b[k].x && a[k].y == b[k].y && a[k].z == b[k].z && a[k].rhw == b[k].rhw;
+		CHECK(same, "ProjectBoxForTest (plain) differs from ProjectCornerPoints");
+		n = OcclusionMath::ProjectBoxForTest(straddle, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, a, plain);
+		const int m = OcclusionMath::ProjectCornersClipped(straddle, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, b);
+		same = !plain && n == m;
+		for (int k = 0; k < n && same; ++k) same = a[k].x == b[k].x && a[k].y == b[k].y && a[k].z == b[k].z;
+		CHECK(same, "ProjectBoxForTest (clipped) differs from ProjectCornersClipped");
+	}
+	// Growth alone can uncover slivers of a box, which is why the plugin draws a grown box together with its original
+	// triangles: random boxes (plain and cut), grown by random amounts; every point of the original triangles must lie
+	// inside the drawn ones (original + grown), and the grown ones alone must miss somewhere (else the test is moot).
+	{
+		auto inTri = [](const OcclusionMath::ScreenVertex& a, const OcclusionMath::ScreenVertex& b, const OcclusionMath::ScreenVertex& c,
+		                float x, float y) {
+			const float d1 = (x - b.x) * (a.y - b.y) - (a.x - b.x) * (y - b.y);
+			const float d2 = (x - c.x) * (b.y - c.y) - (b.x - c.x) * (y - c.y);
+			const float d3 = (x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y);
+			const float e = 1e-3f * (std::fabs(d1) + std::fabs(d2) + std::fabs(d3)) + 0.5f;
+			return !((d1 < -e || d2 < -e || d3 < -e) && (d1 > e || d2 > e || d3 > e));
+		};
+		unsigned seed = 777;
+		auto rnd = [&](float lo, float hi) { seed = seed * 1664525u + 1013904223u; return lo + (hi - lo) * ((seed >> 8) / 16777216.0f); };
+		int boxes = 0, plainBoxes = 0, missed8 = 0, missedN = 0, grownAloneMissed = 0;
+		for (int i = 0; i < 400; ++i) {
+			float bmn[3], bmx[3], corners[8][3];
+			for (int j = 0; j < 3; ++j) {
+				const float cpos = cam[j] + (j == 1 ? rnd(-500, 6000) : rnd(-3000, 3000)), half = rnd(20, 1500);
+				bmn[j] = cpos - half; bmx[j] = cpos + half;
+			}
+			OcclusionMath::AxisCorners(bmn, bmx, corners);
+			OcclusionMath::ScreenVertex s[OcclusionMath::kMaxClippedVertices], g[OcclusionMath::kMaxClippedVertices];
+			OcclusionMath::ScreenVertex t36[36], g36[36];
+			bool plain = false;
+			const int n = OcclusionMath::ProjectBoxForTest(corners, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, s, plain);
+			if (n == 0) continue;
+			++boxes;
+			const float px = rnd(1, 200);
+			const OcclusionMath::ScreenVertex* orig;
+			const OcclusionMath::ScreenVertex* grown;
+			int count;
+			if (plain) {
+				++plainBoxes;
+				for (int k = 0; k < 8; ++k) g[k] = s[k];
+				OcclusionMath::GrowOnScreen(g, px);
+				OcclusionMath::ExpandBox(s, t36);
+				OcclusionMath::ExpandBox(g, g36);
+				orig = t36; grown = g36; count = 36;
+			} else {
+				for (int k = 0; k < n; ++k) g[k] = s[k];
+				OcclusionMath::GrowOnScreenN(g, n, px);
+				orig = s; grown = g; count = n;
+			}
+			for (int k = 0; k + 2 < count; k += 3)
+				for (int q = 0; q < 6; ++q) {   // points spread over each original triangle
+					const float u = rnd(0, 1), w = rnd(0, 1 - u);
+					const float x = orig[k].x + u * (orig[k + 1].x - orig[k].x) + w * (orig[k + 2].x - orig[k].x);
+					const float y = orig[k].y + u * (orig[k + 1].y - orig[k].y) + w * (orig[k + 2].y - orig[k].y);
+					bool covered = false;
+					for (int j = 0; j + 2 < count && !covered; j += 3) covered = inTri(grown[j], grown[j + 1], grown[j + 2], x, y);
+					if (!covered) ++grownAloneMissed;
+					for (int j = 0; j + 2 < count && !covered; j += 3) covered = inTri(orig[j], orig[j + 1], orig[j + 2], x, y);
+					if (!covered) ++(plain ? missed8 : missedN);
+				}
+		}
+		CHECK(boxes > 100 && plainBoxes > 20 && boxes - plainBoxes > 20, "growth test: %d boxes (%d plain)", boxes, plainBoxes);
+		CHECK(missed8 == 0 && missedN == 0, "original + grown boxes uncovered %d + %d points", missed8, missedN);
+		CHECK(grownAloneMissed > 0, "grown boxes alone covered everything: drawing the original too may be unneeded");
+	}
+
 	printf(gFails ? "%d FAILED\n" : "all math checks passed\n", gFails);
 	return gFails ? 1 : 0;
 }
