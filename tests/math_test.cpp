@@ -226,6 +226,74 @@ int main() {
 	CHECK(OcclusionMath::DistanceToBox(in, bmn, bmx) == 0.0f, "inside");
 	CHECK(std::fabs(OcclusionMath::DistanceToBox(out, bmn, bmx) - 5.0f) < 1e-4f, "outside");
 
+	// Clipping at the camera (ProjectCornersClipped).
+	{
+		float ahead[8][3], straddle[8][3], behind[8][3];
+		OcclusionMath::AxisCorners(mn, mx, ahead);
+		const float smn[3] = { cam[0] - 2000, cam[1] - 1000, cam[2] - 200 }, smx[3] = { cam[0] + 2000, cam[1] + 3000, cam[2] + 300 };
+		OcclusionMath::AxisCorners(smn, smx, straddle);
+		const float hmn[3] = { cam[0] - 300, cam[1] - 900, cam[2] - 200 }, hmx[3] = { cam[0] + 300, cam[1] - 100, cam[2] + 200 };
+		OcclusionMath::AxisCorners(hmn, hmx, behind);
+		CHECK(OcclusionMath::CornersUnclipped(ahead, cam, v, p), "box ahead needs clipping");
+		CHECK(!OcclusionMath::CornersUnclipped(straddle, cam, v, p), "box reaching behind the camera needs no clipping");
+		OcclusionMath::ScreenVertex cv[OcclusionMath::kMaxClippedVertices], s8[8];
+		// Ahead: the clipped path gives the same 6 faces (12 triangles) on the same 8 projected corners.
+		const int na = OcclusionMath::ProjectCornersClipped(ahead, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, cv);
+		OcclusionMath::ProjectCornerPoints(ahead, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, s8);
+		CHECK(na == 36, "box ahead clipped into %d vertices, not 36", na);
+		bool onCorners = true;
+		for (int k = 0; k < na; ++k) {
+			bool found = false;
+			for (int j = 0; j < 8; ++j)
+				found = found || (std::fabs(cv[k].x - s8[j].x) < 0.01f && std::fabs(cv[k].y - s8[j].y) < 0.01f &&
+				                  std::fabs(cv[k].z - s8[j].z) < 1e-6f);
+			onCorners = onCorners && found;
+		}
+		CHECK(onCorners, "clipped box ahead has vertices off its corners");
+		// Behind: nothing to draw.
+		CHECK(OcclusionMath::ProjectCornersClipped(behind, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, cv) == 0,
+			"box behind the camera gave triangles");
+		// Straddling (both reversed and standard depth): every vertex in front, within the guard band, depth in range,
+		// and every point of the box that is in front and on screen lies inside one of the triangles.
+		for (int r = 0; r < 2; ++r) {
+			const float* pp = r ? rev : p;
+			const int ns = OcclusionMath::ProjectCornersClipped(straddle, cam, v, pp, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, cv);
+			CHECK(ns > 0 && ns % 3 == 0 && ns <= OcclusionMath::kMaxClippedVertices, "straddling box: %d vertices", ns);
+			bool sane = true;
+			for (int k = 0; k < ns; ++k)
+				sane = sane && cv[k].rhw <= 1.0f + 1e-6f && cv[k].z >= 0.0f && cv[k].z <= 1.0f && std::fabs(cv[k].x - 960) < 5.0f * 1920 &&
+				       std::fabs(cv[k].y - 540) < 5.0f * 1080;
+			CHECK(sane, "straddling box: a vertex out of range (%s depth)", r ? "reversed" : "standard");
+			auto inTri = [](const OcclusionMath::ScreenVertex& a, const OcclusionMath::ScreenVertex& b,
+			                const OcclusionMath::ScreenVertex& c, float x, float y) {
+				const float d1 = (x - b.x) * (a.y - b.y) - (a.x - b.x) * (y - b.y);
+				const float d2 = (x - c.x) * (b.y - c.y) - (b.x - c.x) * (y - c.y);
+				const float d3 = (x - a.x) * (c.y - a.y) - (c.x - a.x) * (y - a.y);
+				const float e = 0.5f;
+				return !((d1 < -e || d2 < -e || d3 < -e) && (d1 > e || d2 > e || d3 > e));
+			};
+			int tested = 0, missed = 0;
+			unsigned seed = 12345;
+			for (int i = 0; i < 4000; ++i) {
+				float q[3];
+				for (int j = 0; j < 3; ++j) {
+					seed = seed * 1664525u + 1013904223u;
+					q[j] = smn[j] + (smx[j] - smn[j]) * ((seed >> 8) / 16777216.0f);
+				}
+				OcclusionMath::Vertex pt = { q[0] - cam[0], q[1] - cam[1], q[2] - cam[2], 0 };
+				OcclusionMath::ScreenVertex sp;
+				if (!OcclusionMath::ProjectToScreen(&pt, 1, v, pp, 0, 0, 1920, 1080, 0, 1, &sp)) continue;
+				if (sp.x < 0 || sp.x > 1919 || sp.y < 0 || sp.y > 1079) continue;
+				++tested;
+				bool covered = false;
+				for (int k = 0; k + 2 < ns && !covered; k += 3) covered = inTri(cv[k], cv[k + 1], cv[k + 2], sp.x, sp.y);
+				if (!covered) ++missed;
+			}
+			CHECK(tested > 100 && missed == 0, "straddling box: %d of %d on-screen points not covered (%s depth)", missed, tested,
+				r ? "reversed" : "standard");
+		}
+	}
+
 	printf(gFails ? "%d FAILED\n" : "all math checks passed\n", gFails);
 	return gFails ? 1 : 0;
 }

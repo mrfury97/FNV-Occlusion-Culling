@@ -29,7 +29,9 @@
 //     stream 0 are changed, each read first and set back to exactly that value. No state blocks: re-sending states (a
 //     D3DSBT_ALL snapshot, or toggling alpha testing) disturbed NVIDIA's alpha-to-coverage driver hack that the game uses
 //     with bTransparencyMultisampling and MSAA, and left a dithered speckle on most surfaces until the game restarted.
-//     Alpha testing is never touched: when it is on at that point, no box is tested that frame.
+//     Alpha testing is never touched. When it is on at that point, the boxes are drawn fully opaque (vertex alpha 255,
+//     stage 0 alpha from the vertex colour, stage 1 off, all put back after) so they pass it; only a comparison that would
+//     cut opaque pixels (LESS, NEVER, ...) still skips the frame.
 // Hooks chain to whatever was there (NVR's F10 CPU profiler patches the same two calls when switched on, and chains).
 //
 // Tighter boxes ([Boxes] bOrientedBoxes): each shape's own vertices (NiGeometryData m_pkVertex, model space) give its
@@ -90,6 +92,8 @@
 #include <cstdio>
 #include <cstring>
 #include <share.h>
+#include <algorithm>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -103,7 +107,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.1.0-dev6";
+constexpr const char* kVersion = "1.1.0-dev10";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -154,6 +158,9 @@ struct Settings {
 	bool treeCulling = true;         // SpeedTree trees and shrubs are tested and hidden too
 	bool landCulling = true;         // land quadrants (2048 x 2048 units, four per cell) are tested and hidden too
 	float landMargin = 32.0f;        // added above and below a quadrant's height range (tessellated land moves)
+	bool lodTerrain = true;          // distant terrain LOD chunks (under the scene's LandLOD node) are tested and hidden too
+	bool grassCulling = true;        // grass groups (TallGrassTriStrips under the scene's Grass node) are tested and hidden too
+	float grassMargin = 32.0f;       // added around a grass group's box on every side (blades sway in the wind)
 	float treeMargin = 32.0f;        // added around a tree's bound (plus 20% of its radius) for its leaf cards
 } gSet;
 
@@ -202,6 +209,9 @@ static void LoadSettings() {
 	gSet.treeMargin = readF("Trees", "fTreeMargin", 32.0f, 0.0f, 1024.0f);
 	gSet.landCulling = readI("Land", "bLandCulling", 1, 0, 1) != 0;
 	gSet.landMargin = readF("Land", "fLandMargin", 32.0f, 0.0f, 1024.0f);
+	gSet.lodTerrain = readI("Land", "bTerrainLOD", 1, 0, 1) != 0;
+	gSet.grassCulling = readI("Grass", "bGrassCulling", 1, 0, 1) != 0;
+	gSet.grassMargin = readF("Grass", "fGrassMargin", 32.0f, 0.0f, 1024.0f);
 	Log("Trees: %s, margin 20%% + %.0f units", gSet.treeCulling ? "tested and hidden like objects" : "never touched (bTreeCulling=0)",
 		gSet.treeMargin);
 	Log("Actors: %s, margin 10%% + %.0f units", gSet.actorCulling ? "tested and hidden like objects" : "never touched (bActorCulling=0)",
@@ -213,6 +223,9 @@ static void LoadSettings() {
 		Log("Actor bones: every frame for all actors (bAnimThrottle=0 or iAnimInterval=1)");
 	Log("Land: %s, height margin %.0f units", gSet.landCulling ? "quadrants tested and hidden like objects" :
 		"never touched (bLandCulling=0)", gSet.landMargin);
+	Log("Distant terrain LOD: %s", gSet.lodTerrain ? "chunks tested and hidden like land" : "never touched (bTerrainLOD=0)");
+	Log("Grass: %s, margin %.0f units", gSet.grassCulling ? "groups tested and hidden like land" : "never touched (bGrassCulling=0)",
+		gSet.grassMargin);
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
 	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
 	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
@@ -313,6 +326,15 @@ namespace Game {
 	constexpr uintptr_t MB_Shape = 0x0C;                          // BSMultiBound::spShape
 	constexpr uintptr_t MBAABB_Center = 0x0C;                     // BSMultiBoundAABB::kCenter
 	constexpr uintptr_t MBAABB_HalfExtents = 0x18;                // BSMultiBoundAABB::kHalfExtents
+	constexpr uintptr_t Vtbl_MBAABB = 0x0101E8E4;                 // BSMultiBoundAABB (BSMultiBoundOBB 0x101E9A4, Sphere 0x101EA8C)
+	constexpr uintptr_t Ni_Name = 0x08;                           // NiObjectNET::m_kName (const char*)
+	constexpr uintptr_t Culler_Planes = 0x2C;                     // NiCullingProcess::m_kPlanes (BSMultiBoundNode::OnVisible)
+	constexpr int VSlot_MBShapeWithinFrustum = 0x9C / 4;          // BSMultiBoundShape::WithinFrustum(NiFrustumPlanes*)
+	// The scene's "Grass" node holds one BSMultiBoundNode per grass group (TallGrassGroup), each with an AABB and one
+	// TallGrassTriStrips child.
+	constexpr uintptr_t Ni_Parent = 0x18;                         // NiAVObject::m_pkParent
+	// TESMain::InitSceneGraph names the scene's roots: "Sky", "Weather", "LODRoot" with "LandLOD" (terrain LOD chunks,
+	// BGSTerrainChunk::Attach) and "DistantRefLOD" under it.
 	constexpr uintptr_t Call_LampTest = 0x00B5E915;         // ShadowSceneNode::PreOnVisible -> ShadowSceneLight::TestFrustumCull 0xB9E970
 
 	// ShadowSceneLight / NiLight / shapes (IDA local types)
@@ -434,9 +456,10 @@ static bool gTreesOn = true;        // bTreeCulling, then the compare key
 static bool gActivatorsOn = true;   // bActivatorCulling, then the compare key
 static bool gRevealOn = true;       // fRevealDepth > 0, then the compare key
 static bool gLandOn = true;         // bLandCulling, then the compare key
+static bool gGrassOn = true;        // bGrassCulling, then the compare key
 static bool gAnimThrottleOn = true; // bAnimThrottle, then the compare key
 constexpr float kRevealMinMove = 0.5f;   // camera moves below this (units per frame) grow nothing
-// 0 the INI's settings, 1 land flipped, 2 actor bone throttle flipped (the features still being compared)
+// 0 the INI's settings, 1 land flipped, 2 grass flipped, 3 actor bone throttle flipped (the features still being compared)
 static int gCompareMode = 0;
 static uint32_t gBoxGen = 1;        // changes when the box mode does: boxes are built again
 static bool gCompareMessage = false;
@@ -461,6 +484,8 @@ struct Stats {
 	double wouldHide = 0, hideGeoms = 0, candGeoms = 0, guardBlocked = 0, tooOld = 0, noAnswer = 0;
 	double issued = 0, answered = 0, notReady = 0, failed = 0, budgetSkips = 0, ageSum = 0, zeroAnswers = 0;
 	double issuedCovered = 0, issuedNew = 0, issuedVisible = 0, notDue = 0, behindCamera = 0, alphaTestFrames = 0;
+	double alphaTestedFrames = 0;   // frames tested with alpha testing on (full-alpha boxes)
+	double clippedBoxes = 0;        // boxes reaching behind the camera or far off screen, tested cut to what can be seen
 	double camMismatch = 0, noDepth = 0, identityResets = 0;
 	double hidden = 0, hiddenGeoms = 0;                    // actually not drawn (hiding on)
 	double lampsOn = 0, lampsTested = 0, lampsNear = 0, lampsCovered = 0, lampShapes = 0, lampShapesCovered = 0;
@@ -477,6 +502,9 @@ struct Stats {
 	} actor, door;
 	double treeSeen = 0, treeCands = 0, treeHidden = 0, treeGeoms = 0, treeHiddenGeoms = 0;
 	double landSeen = 0, landQuads = 0, landNear = 0, landCands = 0, landCovered = 0, landHidden = 0, landGuard = 0;
+	double lodSeen = 0, lodNear = 0, lodCands = 0, lodCovered = 0, lodHidden = 0, lodGuard = 0;
+	double grassSeen = 0, grassNear = 0, grassCands = 0, grassCovered = 0, grassHidden = 0, grassGuard = 0;
+	double mbOutside = 0;   // land / LOD / grass nodes outside the view (left to the game's own test)
 	double lodImposter = 0, lodMenu = 0, lodInvisible = 0;   // not candidates, by kind
 	double impSeen = 0, impCands = 0, impGeoms = 0, impHidden = 0, impHiddenGeoms = 0;
 } gStats;
@@ -969,33 +997,63 @@ static void OnFault(const char* where) {
 }
 
 // True when the object is to be hidden. An exception draws it (and switches the plugin off).
-// Land quadrants: the box is the quadrant's own multibound AABB (the land's real height range), plus fLandMargin up
-// and down. Static: built once, kept while the AABB stays where it was. Hidden on the same rule as objects.
-static bool CollectLand(void* node) {
-	gStats.landSeen += 1;
-	if (!gLandOn || Game::At<uint16_t>(node, Game::Node_ChildSize) != 1) return false;
-	void* mb = Game::At<void*>(node, Game::MBNode_MultiBound);
-	void* shape = mb ? Game::At<void*>(mb, Game::MB_Shape) : nullptr;
-	void* child = *Game::At<void**>(node, Game::Node_ChildBase);
-	if (!shape || !child) return false;
-	const float* c = &Game::At<float>(shape, Game::MBAABB_Center);
-	const float* h = &Game::At<float>(shape, Game::MBAABB_HalfExtents);
-	if (h[0] != 1024.0f || h[1] != 1024.0f || !(h[2] >= 0.0f && h[2] < 100000.0f)) return false;   // not a land quadrant
-	if (!IsKindOf(child, Game::RTTI_NiGeometry)) return false;
-	gStats.landQuads += 1;
+// Multibound nodes (BSMultiBoundNode::OnVisible). Land quadrants: the box is the quadrant's own multibound AABB (the
+// land's real height range), plus fLandMargin up and down. Distant terrain LOD chunks (any node below "LandLOD"): the
+// chunk's AABB, same margin. Static boxes, kept while the AABB stays where it was; hidden on the same rule as objects.
+// Everything else is left alone (developer builds tally it by kind for the log).
+
+static const char* NodeName(void* node) { return node ? Game::At<const char*>(node, Game::Ni_Name) : nullptr; }
+static bool NameIs(void* node, const char* name) { const char* n = NodeName(node); return n && strcmp(n, name) == 0; }
+static const char* RttiName(void* object) {
+	const void* r = (*(GetRTTI_t**)object)[Game::VSlot_GetRTTI](object);
+	return r ? *(const char* const*)r : "?";
+}
+
+static std::unordered_map<std::string, double> gOtherMultiBounds;   // kind -> count (sampled every 8th frame)
+
+static void TallyMultiBound(void* node, void* shape) {
+	void* parent = Game::At<void*>(node, Game::Ni_Parent);
+	void* grand = parent ? Game::At<void*>(parent, Game::Ni_Parent) : nullptr;
+	const uint16_t n = Game::At<uint16_t>(node, Game::Node_ChildSize);
+	void* child = n ? *Game::At<void**>(node, Game::Node_ChildBase) : nullptr;
+	char key[200];
+	const char* own = NodeName(node);
+	const char* pn = NodeName(parent);
+	const char* gn = NodeName(grand);
+	const uintptr_t sv = shape ? *(uintptr_t*)shape : 0;
+	const char* st = sv == Game::Vtbl_MBAABB ? "AABB" : sv == 0x0101E9A4 ? "OBB" : sv == 0x0101EA8C ? "sphere" : shape ? "other" : "none";
+	char size[32] = "";
+	if (sv == Game::Vtbl_MBAABB) {
+		const float* h = &Game::At<float>(shape, Game::MBAABB_HalfExtents);
+		snprintf(size, sizeof size, " %.0fx%.0fx%.0f", 2 * h[0], 2 * h[1], 2 * h[2]);
+	}
+	snprintf(key, sizeof key, "'%s' in '%s' in '%s', %s%s, %u children, first %s", own ? own : "", pn ? pn : "", gn ? gn : "",
+		st, size, (unsigned)n, child ? RttiName(child) : "-");
+	gOtherMultiBounds[key] += 8.0;
+}
+
+enum BoxedKind { kBoxLand, kBoxLod, kBoxGrass };
+
+static bool CollectBoxed(void* node, const float* c, const float* h, BoxedKind kind) {
+	double* st[6];   // near, candidates, covered, hidden, guard (by kind)
+	if (kind == kBoxLand) { st[0] = &gStats.landNear; st[1] = &gStats.landCands; st[2] = &gStats.landCovered; st[3] = &gStats.landHidden; st[4] = &gStats.landGuard; }
+	else if (kind == kBoxLod) { st[0] = &gStats.lodNear; st[1] = &gStats.lodCands; st[2] = &gStats.lodCovered; st[3] = &gStats.lodHidden; st[4] = &gStats.lodGuard; }
+	else { st[0] = &gStats.grassNear; st[1] = &gStats.grassCands; st[2] = &gStats.grassCovered; st[3] = &gStats.grassHidden; st[4] = &gStats.grassGuard; }
 	Record& rec = gRecords[node];
-	if (rec.lastSeen == 0 || !rec.land || rec.pos[0] != c[0] || rec.pos[1] != c[1] || rec.pos[2] != c[2] || rec.scale != h[2]) {
+	if (rec.lastSeen == 0 || !rec.land || rec.pos[0] != c[0] || rec.pos[1] != c[1] || rec.pos[2] != c[2] || rec.scale != h[2] ||
+		rec.lmn[0] != h[0]) {
 		if (rec.lastSeen != 0) gStats.identityResets += 1;
 		if (rec.pending) { rec.query->Release(); rec.query = nullptr; }
 		rec.formID = 0;
 		rec.pos[0] = c[0]; rec.pos[1] = c[1]; rec.pos[2] = c[2];
 		rec.scale = h[2];
+		rec.lmn[0] = h[0];   // unused for these boxes (not oriented): part of the identity
 		rec.pending = false; rec.answered = false; rec.zeroStreak = 0; rec.afterGrown = false; rec.pixels = 0;
 		rec.oriented = false; rec.boxPartial = false; rec.tree = false; rec.actor = false; rec.door = false;
 		rec.land = true;
 		rec.geoms = 1;
 		for (int i = 0; i < 3; ++i) {
-			const float m = i == 2 ? gSet.landMargin : 0.0f;
+			const float m = kind == kBoxGrass ? gSet.grassMargin : (i == 2 ? gSet.landMargin : 0.0f);
 			rec.mn[i] = c[i] - h[i] - m;
 			rec.mx[i] = c[i] + h[i] + m;
 		}
@@ -1003,22 +1061,71 @@ static bool CollectLand(void* node) {
 	}
 	rec.lastSeen = gFrame;
 	rec.boxGen = gBoxGen;
-	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { gStats.landNear += 1; return false; }
-	gStats.landCands += 1;
+	if (OcclusionMath::DistanceToBox(gNowPos, rec.mn, rec.mx) < gSet.nearDistance) { *st[0] += 1; return false; }
+	*st[1] += 1;
 	bool hide = false;
 	if (rec.answered && rec.zeroStreak >= 2) {
-		gStats.landCovered += 1;
+		*st[2] += 1;
 		bool tooOld;
 		hide = AnswerUsable(rec, tooOld);
-		if (!hide) gStats.landGuard += 1;
+		if (!hide) *st[4] += 1;
 	}
 	gCandidates.push_back({ &rec, hide });
-	if (hide && gCullingOn) gStats.landHidden += 1;
+	if (hide && gCullingOn) *st[3] += 1;
 	return hide;
 }
 
-static bool SafeCollectLand(void* node) {
-	__try { return CollectLand(node); }
+typedef bool(__thiscall* WithinFrustum_t)(void*, void*);
+
+// The game's own test for this node's box against the main view's planes (what BSMultiBoundNode::OnVisible does).
+static bool ShapeInView(void* shape, void* culler) {
+	return (*(WithinFrustum_t**)shape)[Game::VSlot_MBShapeWithinFrustum](shape, (char*)culler + Game::Culler_Planes);
+}
+
+static bool CollectLand(void* node, void* culler) {
+	gStats.landSeen += 1;
+	void* mb = Game::At<void*>(node, Game::MBNode_MultiBound);
+	void* shape = mb ? Game::At<void*>(mb, Game::MB_Shape) : nullptr;
+	const uint16_t children = Game::At<uint16_t>(node, Game::Node_ChildSize);
+	if (!shape || !children || *(uintptr_t*)shape != Game::Vtbl_MBAABB) {
+		if (kDevTools && gFrame % 8 == 0) TallyMultiBound(node, shape);
+		return false;
+	}
+	const float* c = &Game::At<float>(shape, Game::MBAABB_Center);
+	const float* h = &Game::At<float>(shape, Game::MBAABB_HalfExtents);
+	const bool sane = h[0] > 0.0f && h[1] > 0.0f && h[2] >= 0.0f && h[0] < 1.0e6f && h[1] < 1.0e6f && h[2] < 1.0e6f;
+	void* child = *Game::At<void**>(node, Game::Node_ChildBase);
+	// A land quadrant: 2048 x 2048, its land strips as the only child.
+	if (sane && children == 1 && h[0] == 1024.0f && h[1] == 1024.0f && child && IsKindOf(child, Game::RTTI_NiGeometry)) {
+		gStats.landQuads += 1;
+		if (!gLandOn) return false;
+		if (!ShapeInView(shape, culler)) { gStats.mbOutside += 1; return false; }
+		return CollectBoxed(node, c, h, kBoxLand);
+	}
+	// A grass group: one TallGrassTriStrips child, directly under the scene's "Grass" node.
+	if (sane && children == 1 && child && NameIs(Game::At<void*>(node, Game::Ni_Parent), "Grass") &&
+		strcmp(RttiName(child), "TallGrassTriStrips") == 0) {
+		gStats.grassSeen += 1;
+		if (!gGrassOn) return false;
+		if (!ShapeInView(shape, culler)) { gStats.mbOutside += 1; return false; }
+		return CollectBoxed(node, c, h, kBoxGrass);
+	}
+	// A distant terrain LOD chunk: somewhere below the scene's "LandLOD" node (a few levels at most).
+	bool lod = false;
+	void* p = Game::At<void*>(node, Game::Ni_Parent);
+	for (int i = 0; p && i < 4 && !lod; ++i, p = Game::At<void*>(p, Game::Ni_Parent)) lod = NameIs(p, "LandLOD");
+	if (sane && lod) {
+		gStats.lodSeen += 1;
+		if (!gSet.lodTerrain || !gLandOn) return false;
+		if (!ShapeInView(shape, culler)) { gStats.mbOutside += 1; return false; }
+		return CollectBoxed(node, c, h, kBoxLod);
+	}
+	if (kDevTools && gFrame % 8 == 0) TallyMultiBound(node, shape);
+	return false;
+}
+
+static bool SafeCollectLand(void* node, void* culler) {
+	__try { return CollectLand(node, culler); }
 	__except (EXCEPTION_EXECUTE_HANDLER) { OnFault("collecting land"); return false; }
 }
 
@@ -1061,15 +1168,38 @@ struct MinimalStates {
 	IDirect3DVertexBuffer9* vb = nullptr;
 	UINT offset = 0, stride = 0;
 	bool active = false;
+	// With alpha testing on, the boxes' alpha must be their own vertex colour (255), not whatever texture stage 0 holds:
+	// stage 0 alpha = diffuse, stage 1 off. Alpha testing itself is never touched.
+	bool alphaOn = false;
+	DWORD alphaOp0 = 0, alphaArg0 = 0, colorOp1 = 0;
 
 	void Set(int i, DWORD value) {
 		if (now[i] != value) { device->SetRenderState(type[i], value); now[i] = value; }
 	}
 
-	// False (and nothing changed) when alpha testing is on: it would cut box pixels and must not be touched.
+	// Whether a fully opaque pixel (alpha 255) passes the alpha comparison func(255, ref).
+	static bool OpaquePasses(DWORD func, DWORD ref) {
+		switch (func) {
+		case D3DCMP_ALWAYS: case D3DCMP_GREATEREQUAL: return true;
+		case D3DCMP_GREATER: case D3DCMP_NOTEQUAL: return ref < 255;
+		case D3DCMP_EQUAL: case D3DCMP_LESSEQUAL: return ref == 255;
+		default: return false;   // LESS, NEVER
+		}
+	}
+
+	// False (and nothing changed) when alpha testing is on with a comparison that would cut fully opaque box pixels.
+	// Alpha testing itself is never written (see the header).
 	bool Enter(IDirect3DDevice9* d, bool depthGrows) {
-		DWORD alphaTest = FALSE;
-		if (FAILED(d->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest)) || alphaTest) return false;
+		DWORD alphaTest = FALSE, func = D3DCMP_ALWAYS, ref = 0;
+		if (FAILED(d->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest))) return false;
+		alphaOn = alphaTest != FALSE;
+		if (alphaOn && (FAILED(d->GetRenderState(D3DRS_ALPHAFUNC, &func)) || FAILED(d->GetRenderState(D3DRS_ALPHAREF, &ref)) ||
+			!OpaquePasses(func, ref & 0xFF)))
+			return false;
+		if (alphaOn && (FAILED(d->GetTextureStageState(0, D3DTSS_ALPHAOP, &alphaOp0)) ||
+			FAILED(d->GetTextureStageState(0, D3DTSS_ALPHAARG1, &alphaArg0)) ||
+			FAILED(d->GetTextureStageState(1, D3DTSS_COLOROP, &colorOp1))))
+			return false;
 		device = d;
 		for (int i = 0; i < kStates; ++i) { device->GetRenderState(type[i], &saved[i]); now[i] = saved[i]; }
 		device->GetRenderState(D3DRS_CULLMODE, &cull);
@@ -1091,12 +1221,22 @@ struct MinimalStates {
 		device->SetVertexShader(nullptr);
 		device->SetPixelShader(nullptr);
 		device->SetFVF(kFVF);
+		if (alphaOn) {
+			if (alphaOp0 != D3DTOP_SELECTARG1) device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+			if (alphaArg0 != D3DTA_DIFFUSE) device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+			if (colorOp1 != D3DTOP_DISABLE) device->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+		}
 		return true;
 	}
 
 	void Leave() {
 		if (!active) return;
 		active = false;
+		if (alphaOn) {
+			if (colorOp1 != D3DTOP_DISABLE) device->SetTextureStageState(1, D3DTSS_COLOROP, colorOp1);
+			if (alphaArg0 != D3DTA_DIFFUSE) device->SetTextureStageState(0, D3DTSS_ALPHAARG1, alphaArg0);
+			if (alphaOp0 != D3DTOP_SELECTARG1) device->SetTextureStageState(0, D3DTSS_ALPHAOP, alphaOp0);
+		}
 		if (decl) device->SetVertexDeclaration(decl); else device->SetFVF(fvf);
 		device->SetStreamSource(0, vb, offset, stride);
 		device->SetVertexShader(vs);
@@ -1112,9 +1252,11 @@ struct MinimalStates {
 static MinimalStates gStates;
 
 // This frame's tests: boxes projected first (8 corners each), drawn after.
-struct BatchItem { Record* rec; int8_t cls; };   // cls -1 = a lamp
+// cls -1 = a lamp. A plain box is its 8 projected corners (expanded into 36 vertices when drawn); a clipped one is
+// its triangle list (count vertices).
+struct BatchItem { Record* rec; int8_t cls; bool clipped; uint32_t first, count; };
 static std::vector<BatchItem> gBatch;
-static std::vector<OcclusionMath::ScreenVertex> gBatchVerts;   // 8 per item
+static std::vector<OcclusionMath::ScreenVertex> gBatchVerts;
 
 static IDirect3DQuery9* AcquireQuery(IDirect3DDevice9* device) {
 	if (!gFreeQueries.empty()) { IDirect3DQuery9* q = gFreeQueries.back(); gFreeQueries.pop_back(); return q; }
@@ -1134,8 +1276,12 @@ static int DrawBatch(IDirect3DDevice9* device) {
 		if (!rec.query) rec.query = AcquireQuery(device);
 		if (!rec.query) break;
 		rec.query->Issue(D3DISSUE_BEGIN);
-		OcclusionMath::ExpandBox(&gBatchVerts[k * 8], tri);
-		device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, tri, sizeof(OcclusionMath::ScreenVertex));
+		if (b.clipped) {
+			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, b.count / 3, &gBatchVerts[b.first], sizeof(OcclusionMath::ScreenVertex));
+		} else {
+			OcclusionMath::ExpandBox(&gBatchVerts[b.first], tri);
+			device->DrawPrimitiveUP(D3DPT_TRIANGLELIST, 12, tri, sizeof(OcclusionMath::ScreenVertex));
+		}
 		rec.query->Issue(D3DISSUE_END);
 		rec.pending = true;
 		rec.issued = gFrame;
@@ -1238,6 +1384,7 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		gDepthGrows = OcclusionMath::DepthGrowsWithDistance(&proj._11);
 		// Boxes are only tested when they can be drawn: an undrawn query would answer 0 pixels and hide its object.
 		if (!gStates.Enter(device, gDepthGrows)) { gStats.alphaTestFrames += 1; canIssue = false; }
+		else if (gStates.alphaOn) gStats.alphaTestedFrames += 1;
 	}
 	if (canIssue && !gCandidates.empty()) {
 		// Who is tested this frame, in what order (Scheduler.h).
@@ -1286,20 +1433,31 @@ static __declspec(noinline) void RunQueries(void* camera) {
 				if (grow > gStats.revealMaxPx) gStats.revealMaxPx = grow;
 			}
 		}
+		// Boxes reaching behind the camera or far past a screen edge are cut to what can be drawn (OcclusionMath::
+		// ProjectCornersClipped); a box with nothing in front of the camera is not tested.
 		auto add = [&](Record& rec, const float (*corners)[3], int8_t cls) {
 			const size_t at = gBatchVerts.size();
-			gBatchVerts.resize(at + 8);
-			if (!OcclusionMath::ProjectCornerPoints(corners, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
-				(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at])) {
-				gBatchVerts.resize(at);
-				return false;
+			const bool plain = OcclusionMath::CornersUnclipped(corners, posAdjust, &view._11, &proj._11);
+			uint32_t count = 8;
+			if (plain) {
+				gBatchVerts.resize(at + 8);
+				OcclusionMath::ProjectCornerPoints(corners, posAdjust, &view._11, &proj._11, (float)vp.X, (float)vp.Y,
+					(float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at]);
+			} else {
+				gBatchVerts.resize(at + OcclusionMath::kMaxClippedVertices);
+				count = (uint32_t)OcclusionMath::ProjectCornersClipped(corners, posAdjust, &view._11, &proj._11, (float)vp.X,
+					(float)vp.Y, (float)vp.Width, (float)vp.Height, vp.MinZ, vp.MaxZ, 0xFFFFFFFF, &gBatchVerts[at]);
+				gBatchVerts.resize(at + count);
+				if (!count) return false;
+				gStats.clippedBoxes += 1;
 			}
 			rec.issuedGrown = grow > 0.0f && rec.answered && (rec.zeroStreak > 0 || rec.afterGrown);
 			if (rec.issuedGrown) {
-				OcclusionMath::GrowOnScreen(&gBatchVerts[at], grow);
+				if (plain) OcclusionMath::GrowOnScreen(&gBatchVerts[at], grow);
+				else OcclusionMath::GrowOnScreenN(&gBatchVerts[at], (int)count, grow);
 				gStats.revealGrown += 1;
 			}
-			gBatch.push_back({ &rec, cls });
+			gBatch.push_back({ &rec, cls, !plain, (uint32_t)at, count });
 			return true;
 		};
 		for (Lamp* lamp : gLampCandidates) {
@@ -1422,6 +1580,21 @@ static void LogBlock() {
 		"tested | covered %.1f: hidden %.1f, camera guard / answer too old %.1f", gLandOn ? "on" : "off", gStats.landSeen / f,
 		gStats.landQuads / f, gStats.landNear / f, gStats.landCands / f, gStats.landCovered / f, gStats.landHidden / f,
 		gStats.landGuard / f);
+	Log("  distant terrain LOD (%s): %.1f chunks per frame drawn by the main view, %.1f near the camera, %.1f tested | covered "
+		"%.1f: hidden %.1f, camera guard / answer too old %.1f", gSet.lodTerrain && gLandOn ? "on" : "off", gStats.lodSeen / f,
+		gStats.lodNear / f, gStats.lodCands / f, gStats.lodCovered / f, gStats.lodHidden / f, gStats.lodGuard / f);
+	Log("  grass (%s): %.1f groups per frame drawn by the main view, %.1f near the camera, %.1f tested | covered %.1f: hidden "
+		"%.1f, camera guard / answer too old %.1f | land, LOD and grass nodes outside the view %.1f", gGrassOn ? "on" : "off",
+		gStats.grassSeen / f, gStats.grassNear / f, gStats.grassCands / f, gStats.grassCovered / f, gStats.grassHidden / f,
+		gStats.grassGuard / f, gStats.mbOutside / f);
+	if (!gOtherMultiBounds.empty()) {
+		std::vector<std::pair<double, std::string>> kinds;
+		for (auto& k : gOtherMultiBounds) kinds.push_back({ k.second, k.first });
+		std::sort(kinds.begin(), kinds.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
+		Log("  other multibound nodes, left alone (per frame, sampled every 8th frame; %u kinds):", (unsigned)kinds.size());
+		for (size_t i = 0; i < kinds.size() && i < 12; ++i) Log("    %.1f  %s", kinds[i].first / f, kinds[i].second.c_str());
+		gOtherMultiBounds.clear();
+	}
 	{
 		using namespace AnimCost;
 		const double us = 1e6 / (double)gQpcFreq.QuadPart / f;
@@ -1498,11 +1671,12 @@ static void LogBlock() {
 	Log("  cost per frame: %.0f us query pass (CPU) = %.0f reading answers (%.1f left for the next frame unasked) + %.0f "
 		"planning (over budget in %.0f%% of frames) + %.0f preparing boxes + %.0f drawing the tests | frames skipped: %.0f camera "
 		"mismatch, %.0f "
-		"no depth buffer, %.0f alpha testing on | boxes reaching behind the camera %.1f per frame | identity resets %.0f",
+		"no depth buffer, %.0f alpha test that would cut the boxes | tested with alpha testing on (full-alpha boxes) %.0f frames | "
+		"boxes cut at the camera or screen edge %.1f, with nothing in front of the camera %.1f per frame | identity resets %.0f",
 		gStats.queryUs / f, gStats.pollUs / f, gStats.pollsSkipped / f, gStats.planUs / f, 100.0 * gStats.sorted / f,
 		gStats.prepUs / f, gStats.drawUs / f,
-		gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames,
-		gStats.behindCamera / f, gStats.identityResets);
+		gStats.camMismatch, gStats.noDepth, gStats.alphaTestFrames, gStats.alphaTestedFrames,
+		gStats.clippedBoxes / f, gStats.behindCamera / f, gStats.identityResets);
 	gStats = Stats{};
 }
 
@@ -1661,7 +1835,7 @@ static void __fastcall TreeOnVisibleHook(void* node, void*, void* culler) {
 
 static void __fastcall MultiBoundOnVisibleHook(void* node, void*, void* culler) {
 	if (gInMain && culler == gMainCuller && GetCurrentThreadId() == gMainThread && gFadeDepth == 0 &&
-		SafeCollectLand(node) && gCullingOn && !gFaulted)
+		SafeCollectLand(node, culler) && gCullingOn && !gFaulted)
 		return;   // proven covered: the quadrant's land is not drawn
 	OrigMultiBoundOnVisible(node, culler);
 }
@@ -1700,13 +1874,15 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (kDevTools && gSet.compareKey && controls && !Game::IsInMenuMode() &&
 		Game::GetKeyboardButton(controls, gSet.compareKey, Game::KeyPressed)) {
 		if (gStats.frames > 0) LogBlock();   // the numbers so far belong to the old mode
-		// One feature at a time against the INI's settings: as set -> land flipped -> bone throttle flipped -> as set.
-		gCompareMode = (gCompareMode + 1) % 3;
+		// One feature at a time against the INI's settings: as set -> land flipped -> grass flipped -> bone throttle
+		// flipped -> as set.
+		gCompareMode = (gCompareMode + 1) % 4;
 		gLandOn = gSet.landCulling != (gCompareMode == 1);
-		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 2);
+		gGrassOn = gSet.grassCulling != (gCompareMode == 2);
+		gAnimThrottleOn = gSet.animThrottle != (gCompareMode == 3);
 		gCompareMessage = true;
-		Log("[frame %u] compare key: land %s, actor bone throttle %s", gFrame, gLandOn ? "ON" : "OFF",
-			gAnimThrottleOn ? "ON" : "OFF");
+		Log("[frame %u] compare key: land %s, grass %s, actor bone throttle %s", gFrame, gLandOn ? "ON" : "OFF",
+			gGrassOn ? "ON" : "OFF", gAnimThrottleOn ? "ON" : "OFF");
 	}
 	SafeRunQueries(camera);
 	if (kDevTools) gStats.queryUs += MicrosSince(start);
@@ -1726,9 +1902,9 @@ static void __cdecl OpaqueHook(void* camera, void* accumulator) {
 	if (gCompareMessage) {
 		gCompareMessage = false;
 		static char message[160];
-		static const char* const kWhat[3] = { "as set in the INI", "land switched", "bone throttle switched" };
-		snprintf(message, sizeof(message), "Occlusion culling (%s): land %s, bones %s", kWhat[gCompareMode],
-			gLandOn ? "ON" : "OFF", gAnimThrottleOn ? "half rate" : "every frame");
+		static const char* const kWhat[4] = { "as set in the INI", "land switched", "grass switched", "bone throttle switched" };
+		snprintf(message, sizeof(message), "Occlusion culling (%s): land %s, grass %s, bones %s", kWhat[gCompareMode],
+			gLandOn ? "ON" : "OFF", gGrassOn ? "ON" : "OFF", gAnimThrottleOn ? "throttled" : "every frame");
 		Game::ShowMessage(message, 0, nullptr, nullptr, 2.0f, true);
 	}
 	if (gToggleMessage) {
@@ -1976,6 +2152,7 @@ static void MessageHandler(NVSEMessagingInterface::Message* msg) {
 	gRevealOn = gSet.revealDepth > 0.0f;
 	gAnimThrottleOn = gSet.animThrottle;
 	gLandOn = gSet.landCulling;
+	gGrassOn = gSet.grassCulling;
 	if (kDevTools)
 		Log("Hiding starts %s; key 0x%02X switches it. A block of numbers is logged every %d frames of world view.",
 			gCullingOn ? "ON" : "OFF (measuring only)", gSet.toggleKey, gSet.logInterval);

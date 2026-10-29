@@ -69,9 +69,11 @@ Defaults below are the developer INI's; the release INI's differences are listed
 | `bActivatorCulling` / `fActivatorMargin` | 1 / 16 | Doors, activators, talking activators and terminals are hidden when proven covered; like actors, their box follows them every frame (bound + 5% + margin) and they stay hidden only while inside the box that was tested |
 | `bTreeCulling` / `fTreeMargin` | 1 / 32 | SpeedTree trees and shrubs (their own node type, which the object hook never saw) are hidden when proven covered; their box is the bound plus 20% + margin, since leaf cards are spread out on the graphics card |
 | `bLandCulling` / `fLandMargin` | 1 / 32 | Land is tested in its four 2048 x 2048 squares per cell (the game's own BSMultiBoundNode quadrants) and hidden when proven covered, e.g. ground behind buildings and hills; the box is the square's height range plus the margin. Chains through lStewieAl's Tweaks, which replaces that function. Up to 45% of the ~100 loaded squares hidden on the Strip |
+| `bTerrainLOD` | 1 | Distant terrain LOD chunks (the low-detail land beyond the loaded cells, under the scene's LandLOD node) are tested and hidden like land; 20-50% of them hidden in play |
+| `bGrassCulling` / `fGrassMargin` | 1 / 32 | Grass groups (TallGrassTriStrips under the scene's Grass node) are tested and hidden like land, with the margin on every side for swaying blades; up to ~60% of the groups in view hidden |
 | `bLampCulling` | 0 | 1 = a lamp whose whole reach is proven covered is switched off for the main view (saves its lighting passes); never within `fNearDistance` |
 | `bOrientedBoxes` | 1 | Tighter boxes: each shape's own vertices give its extent, and the box follows the object's rotation. Shapes whose vertices the game has freed keep their bound spheres; animated objects keep the old box |
-| `iCompareKey` | 207 (End) | Developer builds only: switches one feature at a time against your settings (as set, land switched, actor bone throttle switched); the log starts a new block at each press |
+| `iCompareKey` | 207 (End) | Developer builds only: switches one feature at a time against your settings (as set, land switched, grass switched, actor bone throttle switched); the log starts a new block at each press |
 | `iLogInterval` | 600 | Developer builds only: frames of world view per block of numbers in the log |
 | `bDebugBoxes` | 0 | Developer builds only: draws the tested boxes (green visible, red hidden) |
 

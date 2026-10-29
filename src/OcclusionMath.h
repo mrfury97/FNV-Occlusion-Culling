@@ -150,6 +150,106 @@ namespace OcclusionMath {
 		return true;
 	}
 
+	// The 6 faces of a box as corner quads (kCorner numbering).
+	static const int kBoxFaces[6][4] = { { 0, 1, 2, 3 }, { 4, 5, 6, 7 }, { 0, 1, 5, 4 }, { 3, 2, 6, 7 }, { 0, 3, 7, 4 },
+	                                     { 1, 2, 6, 5 } };
+	constexpr float kClipGuard = 4.0f;            // clip-space |x|, |y| kept within this many half-screens of the centre
+	constexpr int kMaxClippedVertices = 6 * 7 * 3;   // a quad clipped by 5 planes has at most 9 corners = 7 triangles
+
+	// A box's corners in clip space (camera-relative points through view * projection).
+	inline void ClipCorners(const float (*corners)[3], const float* origin, const float* view, const float* proj, float (*c)[4]) {
+		for (int k = 0; k < 8; ++k) {
+			const float p[4] = { corners[k][0] - origin[0], corners[k][1] - origin[1], corners[k][2] - origin[2], 1.0f };
+			float v[4];
+			for (int j = 0; j < 4; ++j) v[j] = p[0] * view[0 * 4 + j] + p[1] * view[1 * 4 + j] + p[2] * view[2 * 4 + j] + p[3] * view[3 * 4 + j];
+			for (int j = 0; j < 4; ++j) c[k][j] = v[0] * proj[0 * 4 + j] + v[1] * proj[1 * 4 + j] + v[2] * proj[2 * 4 + j] + v[3] * proj[3 * 4 + j];
+		}
+	}
+
+	// Signed distance of a clip-space point to plane i (>= 0 = kept): w >= wMin, then |x| and |y| <= kClipGuard * w.
+	inline float ClipPlane(const float* v, int i, float wMin) {
+		switch (i) {
+		case 0: return v[3] - wMin;
+		case 1: return kClipGuard * v[3] - v[0];
+		case 2: return kClipGuard * v[3] + v[0];
+		case 3: return kClipGuard * v[3] - v[1];
+		default: return kClipGuard * v[3] + v[1];
+		}
+	}
+
+	// A box that reaches behind the camera (or far past a screen edge), cut to what can be drawn pre-transformed: each
+	// face is clipped (Sutherland-Hodgman, clip space) at w = wMin and at kClipGuard screens to each side, fanned into
+	// triangles and projected like ProjectToScreen. The cut parts are behind the camera or far off screen, where they
+	// cover no pixel. Depth is clamped into [minZ, maxZ]: points closer than the near plane count as the nearest depth,
+	// which can only make the box easier to see. Returns the triangle-list vertex count (at most kMaxClippedVertices);
+	// 0 = no part of the box is in front of the camera.
+	inline int ProjectCornersClipped(const float (*corners)[3], const float* origin, const float* view, const float* proj,
+		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out, float wMin = 1.0f) {
+		float c[8][4];
+		ClipCorners(corners, origin, view, proj, c);
+		const float lo = minZ < maxZ ? minZ : maxZ, hi = minZ < maxZ ? maxZ : minZ;
+		int n = 0;
+		for (const int* face : kBoxFaces) {
+			float poly[9][4], next[9][4];
+			int m = 4;
+			for (int k = 0; k < 4; ++k)
+				for (int j = 0; j < 4; ++j) poly[k][j] = c[face[k]][j];
+			for (int plane = 0; plane < 5 && m >= 3; ++plane) {
+				int o = 0;
+				for (int e = 0; e < m; ++e) {
+					const float* a = poly[e];
+					const float* b = poly[(e + 1) % m];
+					const float da = ClipPlane(a, plane, wMin), db = ClipPlane(b, plane, wMin);
+					if (da >= 0.0f) { for (int j = 0; j < 4; ++j) next[o][j] = a[j]; ++o; }
+					if ((da >= 0.0f) != (db >= 0.0f)) {
+						const float t = da / (da - db);
+						for (int j = 0; j < 4; ++j) next[o][j] = a[j] + (b[j] - a[j]) * t;
+						if (plane == 0) next[o][3] = wMin;
+						++o;
+					}
+				}
+				m = o;
+				for (int k = 0; k < m; ++k)
+					for (int j = 0; j < 4; ++j) poly[k][j] = next[k][j];
+			}
+			if (m < 3) continue;
+			ScreenVertex s[9];
+			for (int k = 0; k < m; ++k) {
+				const float w = poly[k][3] > wMin ? poly[k][3] : wMin;
+				const float iw = 1.0f / w;
+				float z = minZ + poly[k][2] * iw * (maxZ - minZ);
+				z = z < lo ? lo : (z > hi ? hi : z);
+				s[k] = { vpX + (poly[k][0] * iw * 0.5f + 0.5f) * vpW - 0.5f, vpY + (0.5f - poly[k][1] * iw * 0.5f) * vpH - 0.5f,
+				         z, iw, color };
+			}
+			for (int k = 1; k + 1 < m; ++k) { out[n++] = s[0]; out[n++] = s[k]; out[n++] = s[k + 1]; }
+		}
+		return n;
+	}
+
+	// Whether every corner lies inside the planes ProjectCornersClipped cuts at (then the plain 8-corner path is exact).
+	inline bool CornersUnclipped(const float (*corners)[3], const float* origin, const float* view, const float* proj, float wMin = 1.0f) {
+		float c[8][4];
+		ClipCorners(corners, origin, view, proj, c);
+		for (int k = 0; k < 8; ++k)
+			for (int plane = 0; plane < 5; ++plane)
+				if (ClipPlane(c[k], plane, wMin) < 0.0f) return false;
+		return true;
+	}
+
+	// GrowOnScreen for any number of vertices (a clipped box's triangle list): each moves `px` pixels away from their
+	// centre along x and y.
+	inline void GrowOnScreenN(ScreenVertex* s, int count, float px) {
+		if (count <= 0) return;
+		float cx = 0.0f, cy = 0.0f;
+		for (int k = 0; k < count; ++k) { cx += s[k].x; cy += s[k].y; }
+		cx /= (float)count; cy /= (float)count;
+		for (int k = 0; k < count; ++k) {
+			s[k].x += s[k].x >= cx ? px : -px;
+			s[k].y += s[k].y >= cy ? px : -px;
+		}
+	}
+
 	// The same as BoxTriangles + ProjectToScreen, projecting only the 8 corners (the 36 vertices are copies of them).
 	inline bool ProjectBox(const float* mn, const float* mx, const float* origin, const float* view, const float* proj,
 		float vpX, float vpY, float vpW, float vpH, float minZ, float maxZ, uint32_t color, ScreenVertex* out) {
