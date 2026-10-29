@@ -107,7 +107,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.1.0-dev10";
+constexpr const char* kVersion = "1.1.0";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -2170,7 +2170,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(NVSEInterface* nvse) {
 	CreateDirectoryA("logs", nullptr);
 	gLog = _fsopen("logs\\OcclusionCulling.log", "w", _SH_DENYWR);
-	Log("Occlusion Culling %s, %s (objects, actors, doors/activators, SpeedTree trees and hidden lamps)", kVersion, OC_BUILD);
+	Log("Occlusion Culling %s, %s (objects, actors, doors/activators, trees, land, terrain LOD, grass and hidden lamps)", kVersion, OC_BUILD);
 	QueryPerformanceFrequency(&gQpcFreq);
 	LoadSettings();
 	auto* messaging = (NVSEMessagingInterface*)nvse->QueryInterface(kInterface_Messaging);
