@@ -133,7 +133,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.2.3-dev1";
+constexpr const char* kVersion = "1.2.3";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
