@@ -137,6 +137,35 @@ namespace OcclusionMath {
 		}
 	}
 
+	// A box (8 corners in kCorner order, edges at right angles: axis or oriented boxes) grown by `px` pixels' worth of
+	// world units at its farthest corner from `eye`, on every side: m = px * farthest distance / focal (focal in pixels).
+	// Every point within m of the box lies inside the grown one, so on screen it reaches at least px pixels past the
+	// box's outline wherever the box is nearer than its farthest corner. Returns m.
+	inline float PadCorners(const float (*c)[3], const float* eye, float px, float focal, float (*out)[3]) {
+		float far2 = 0.0f;
+		for (int k = 0; k < 8; ++k) {
+			const float dx = c[k][0] - eye[0], dy = c[k][1] - eye[1], dz = c[k][2] - eye[2];
+			const float d2 = dx * dx + dy * dy + dz * dz;
+			if (d2 > far2) far2 = d2;
+		}
+		const float m = focal > 0.0f ? px * std::sqrt(far2) / focal : 0.0f;
+		float u[3][3];
+		static const int kEdgeEnd[3] = { 1, 3, 4 };   // corner 0 -> x max, y max, z max
+		for (int i = 0; i < 3; ++i) {
+			float e[3], len = 0.0f;
+			for (int j = 0; j < 3; ++j) { e[j] = c[kEdgeEnd[i]][j] - c[0][j]; len += e[j] * e[j]; }
+			len = std::sqrt(len);
+			for (int j = 0; j < 3; ++j) u[i][j] = len > 1e-3f ? e[j] / len : (i == j ? 1.0f : 0.0f);   // flat side: world axis
+		}
+		for (int k = 0; k < 8; ++k)
+			for (int j = 0; j < 3; ++j) {
+				float p = c[k][j];
+				for (int i = 0; i < 3; ++i) p += (kCorner[k][i] ? m : -m) * u[i][j];
+				out[k][j] = p;
+			}
+		return m;
+	}
+
 	// The 36 triangle-list vertices of 8 projected corners.
 	inline void ExpandBox(const ScreenVertex* s8, ScreenVertex* out36) {
 		for (int k = 0; k < 36; ++k) out36[k] = s8[kBoxIndices[k]];

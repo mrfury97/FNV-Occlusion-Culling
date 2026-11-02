@@ -129,6 +129,39 @@ int main() {
 				"grown rectangle: %.2f %.2f %.2f %.2f", x0 - gx0, gx1 - x1, y0 - gy0, gy1 - y1);
 			CHECK(depths, "growing changed depths");
 		}
+		// Padding against jitter: a LOD-sized box 25,000 units ahead (flat, 16384 x 16384 x 0 like a water-level chunk),
+		// a nearby one and an oriented one each reach at least 1.5 px further on every side of their screen rectangle.
+		{
+			const float focal = (p[0] * 1920.0f < p[5] * 1080.0f ? p[0] * 1920.0f : p[5] * 1080.0f) * 0.5f;
+			float boxes[3][8][3];
+			const float fmn[3] = { cam[0] - 8192, cam[1] + 25000, cam[2] - 500 }, fmx[3] = { cam[0] + 8192, cam[1] + 41384, cam[2] - 500 };
+			OcclusionMath::AxisCorners(fmn, fmx, boxes[0]);
+			OcclusionMath::AxisCorners(mn, mx, boxes[1]);
+			const float c30 = 0.8660254f, s30 = 0.5f;
+			const float rot[9] = { c30, -s30, 0, s30, c30, 0, 0, 0, 1 }, org[3] = { cam[0] + 200, cam[1] + 3000, cam[2] };
+			const float lmn[3] = { -400, -20, -100 }, lmx[3] = { 400, 20, 150 };
+			OcclusionMath::OrientedCorners(rot, org, lmn, lmx, boxes[2]);
+			for (int b = 0; b < 3; ++b) {
+				float pc[8][3];
+				const float m = OcclusionMath::PadCorners(boxes[b], cam, 1.5f, focal, pc);
+				OcclusionMath::ScreenVertex o8[8], p8[8];
+				CHECK(OcclusionMath::ProjectCornerPoints(boxes[b], cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, o8) &&
+					OcclusionMath::ProjectCornerPoints(pc, cam, v, p, 0, 0, 1920, 1080, 0, 1, 0xFFFFFFFF, p8), "padded box %d refused", b);
+				float r[2][4];
+				for (int s = 0; s < 2; ++s) {
+					const OcclusionMath::ScreenVertex* q = s ? p8 : o8;
+					r[s][0] = r[s][2] = 1e9f; r[s][1] = r[s][3] = -1e9f;
+					for (int k = 0; k < 8; ++k) {
+						r[s][0] = q[k].x < r[s][0] ? q[k].x : r[s][0]; r[s][1] = q[k].x > r[s][1] ? q[k].x : r[s][1];
+						r[s][2] = q[k].y < r[s][2] ? q[k].y : r[s][2]; r[s][3] = q[k].y > r[s][3] ? q[k].y : r[s][3];
+					}
+				}
+				const float l = r[0][0] - r[1][0], rt = r[1][1] - r[0][1], t = r[0][2] - r[1][2], bt = r[1][3] - r[0][3];
+				CHECK(l >= 1.49f && rt >= 1.49f && t >= 1.49f && bt >= 1.49f, "padded box %d grew %.2f %.2f %.2f %.2f px (margin %.1f units)",
+					b, l, rt, t, bt, m);
+				CHECK(b != 0 || (m > 20.0f && m < 80.0f), "far LOD box margin %.1f units", m);
+			}
+		}
 		// Reveal distance: 1920 wide, 75 degree view (proj11 1.303), 6 units of sideways move, edge 100 units away:
 		// 960 * 1.303 * 6 / 100 = 75 px; nothing when still; capped.
 		CHECK(std::fabs(OcclusionMath::RevealPixels(960.0f, 1.303f, 6.0f, 100.0f, 480.0f) - 75.05f) < 0.1f, "reveal px %.2f",

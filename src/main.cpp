@@ -94,6 +94,14 @@
 // is drawn but tested again the very next frame, and one 0-pixel answer puts back the covered state it had before (a
 // grown box's pixels need not be the object's own), so an early reveal costs about two frames of drawing, not six.
 //
+// Padding against camera jitter ([Queries] fScreenPadPixels): NVR's TAA and DLSS shift the projection by up to half a
+// pixel every frame (a Halton sequence), and an answer drawn with one frame's shift is used in the next. Something
+// showing only a pixel or two (a distant LOD chunk peeking over a ridge, an object at an occluder's edge) can test 0
+// pixels with one shift and be on screen with the next: hidden, its box shows pixels, drawn, hidden again, and the
+// skyline blinks (1.2.2 caught terrain and object LOD this way). So every tested box is grown in the world by
+// fScreenPadPixels pixels' worth at its farthest corner (OcclusionMath::PadCorners): about 40 units for a LOD chunk
+// 25,000 units away, under a unit for things nearby.
+//
 // Hidden lamps ([Lamps]): every frame ShadowSceneNode::PreOnVisible runs ShadowSceneLight::TestFrustumCull (call at
 // 0xB5E915, also patched by NVR's KeepLampsInView, which we chain) on each lamp; usFrustumCull (+0x110) = 255 switches
 // the lamp off for that frame, and the game marks the shaders of every shape the lamp lights (kGeometries +0xE0,
@@ -125,7 +133,7 @@ constexpr bool kDevTools = false;
 constexpr bool kDevTools = true;
 #define OC_BUILD "developer build"
 #endif
-constexpr const char* kVersion = "1.2.2";
+constexpr const char* kVersion = "1.2.3-dev1";
 
 #include "nvse/nvse_version.h"
 #include "nvse/PluginAPI.h"
@@ -157,6 +165,7 @@ struct Settings {
 	float guardDegrees = 2.5f;       // camera turn per frame of answer age beyond which an answer is not used
 	float guardUnits = 32.0f;        // camera move per frame of answer age
 	float revealDepth = 150.0f;      // boxes grow by how far a camera move slides an edge this far away (0 = off)
+	float screenPad = 1.5f;          // every box reaches at least this many pixels past its object on screen (TAA jitter)
 	int logInterval = 600;           // frames per log block
 	bool debugBoxes = false;         // draw the tested boxes (green: visible, red: hidden; red ones through walls)
 	bool culling = true;             // start with hiding on
@@ -208,6 +217,7 @@ static void LoadSettings() {
 	gSet.guardDegrees = readF("Queries", "fGuardDegreesPerFrame", 2.5f, 0.1f, 45.0f);
 	gSet.guardUnits = readF("Queries", "fGuardUnitsPerFrame", 32.0f, 1.0f, 1000.0f);
 	gSet.revealDepth = readF("Queries", "fRevealDepth", 150.0f, 0.0f, 100000.0f);
+	gSet.screenPad = readF("Queries", "fScreenPadPixels", 1.5f, 0.0f, 16.0f);
 	gSet.logInterval = readI("Debug", "iLogInterval", 600, 60, 100000);
 	gSet.debugBoxes = kDevTools && readI("Debug", "bDebugBoxes", 0, 0, 1) != 0;
 	gSet.culling = readI("General", "bCulling", 1, 0, 1) != 0;
@@ -256,8 +266,9 @@ static void LoadSettings() {
 	Log("Grass: %s, margin %.0f units", gSet.grassCulling ? "groups tested and hidden like land" : "never touched (bGrassCulling=0)",
 		gSet.grassMargin);
 	Log("Lamps: hidden lamps %s", gSet.lampCulling ? "switched off in the main view" : "measured only (bLampCulling=0)");
-	if (kDevTools) Log("Boxes: oriented %d | compare key 0x%02X", gSet.orientedBoxes, gSet.compareKey);
-	else Log("Boxes: oriented %d | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.revealDepth);
+	if (kDevTools) Log("Boxes: oriented %d, padded %.1f pixels | compare key 0x%02X", gSet.orientedBoxes, gSet.screenPad, gSet.compareKey);
+	else Log("Boxes: oriented %d, padded %.1f pixels | boxes grow while moving: fRevealDepth %.0f", gSet.orientedBoxes, gSet.screenPad,
+		gSet.revealDepth);
 	Log("Settings: enabled %d, hiding %s at start, on/off key 0x%02X | candidates: radius >= %.0f, box farther than %.0f, "
 		"distant LOD %d, imposters %d | queries: %d per frame, answers up to %d frames old, visible objects retested every %d frames, guard %.1f deg / "
 		"%.0f units per frame | log every %d frames, debug boxes %d", gSet.enabled, gSet.culling ? "on" : "off", gSet.toggleKey,
@@ -1470,7 +1481,15 @@ static __declspec(noinline) void RunQueries(void* camera) {
 		}
 		// Boxes reaching behind the camera or far past a screen edge are cut to what can be drawn (OcclusionMath::
 		// ProjectCornersClipped); a box with nothing in front of the camera is not tested.
-		auto add = [&](Record& rec, const float (*corners)[3], int8_t cls) {
+		// Padding against TAA/DLSS jitter (see the header): world units per pixel of padding at one unit of distance.
+		const float focal = min(std::fabs(proj._11) * (float)vp.Width, std::fabs(proj._22) * (float)vp.Height) * 0.5f;
+		auto add = [&](Record& rec, const float (*box)[3], int8_t cls) {
+			float padded[8][3];
+			const float (*corners)[3] = box;
+			if (gSet.screenPad > 0.0f) {
+				OcclusionMath::PadCorners(box, gNowPos, gSet.screenPad, focal, padded);
+				corners = padded;
+			}
 			const size_t at = gBatchVerts.size();
 			gBatchVerts.resize(at + OcclusionMath::kMaxClippedVertices);
 			bool plain = true;
